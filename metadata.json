@@ -1,0 +1,6 @@
+{
+  "name": "CineFlow Pro",
+  "description": "Pro cinema HD video recorder supporting high-speed 120-240 FPS recording, video stabilization, advanced cinematic filters, and manual exposure controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
