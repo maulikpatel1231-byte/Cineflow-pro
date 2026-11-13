@@ -41,6 +41,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _stabilizationMode = MutableStateFlow(StabilizationMode.HYBRID)
     val stabilizationMode: StateFlow<StabilizationMode> = _stabilizationMode.asStateFlow()
 
+    private val _isHardwareStabilizationEnabled = MutableStateFlow(true)
+    val isHardwareStabilizationEnabled: StateFlow<Boolean> = _isHardwareStabilizationEnabled.asStateFlow()
+
+    val isHardwareStabilizationSupported: StateFlow<Boolean> = engine.isHardwareStabilizationSupported
+    val isHardwareStabilizationActive: StateFlow<Boolean> = engine.isHardwareStabilizationActive
+
     private val _exposureMode = MutableStateFlow(ExposureMode.AUTO)
     val exposureMode: StateFlow<ExposureMode> = _exposureMode.asStateFlow()
 
@@ -150,10 +156,45 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setStabilizationMode(mode: StabilizationMode) {
+        if (isRecording.value) {
+            showToast("Stop recording to change stabilization mode")
+            return
+        }
         _stabilizationMode.value = mode
         engine.stabilizationMode = mode
-        engine.updateLiveControls()
+        val shouldEnableHw = mode != StabilizationMode.OFF
+        if (_isHardwareStabilizationEnabled.value != shouldEnableHw) {
+            _isHardwareStabilizationEnabled.value = shouldEnableHw
+            engine.isHardwareVideoStabilizationEnabled = shouldEnableHw
+            engine.bindCameraUseCases()
+        } else {
+            engine.updateLiveControls()
+        }
         showToast("Stabilizer: ${mode.label}")
+    }
+
+    fun toggleHardwareStabilization(enabled: Boolean = !_isHardwareStabilizationEnabled.value) {
+        if (isRecording.value) {
+            showToast("Stop recording to toggle hardware stabilization")
+            return
+        }
+        _isHardwareStabilizationEnabled.value = enabled
+        engine.isHardwareVideoStabilizationEnabled = enabled
+        if (enabled && _stabilizationMode.value == StabilizationMode.OFF) {
+            _stabilizationMode.value = StabilizationMode.HYBRID
+            engine.stabilizationMode = StabilizationMode.HYBRID
+        } else if (!enabled && _stabilizationMode.value != StabilizationMode.OFF) {
+            _stabilizationMode.value = StabilizationMode.OFF
+            engine.stabilizationMode = StabilizationMode.OFF
+        }
+        engine.bindCameraUseCases()
+        val hwSupported = isHardwareStabilizationSupported.value
+        val msg = when {
+            !enabled -> "Hardware Video Stabilization: OFF"
+            hwSupported -> "Hardware Video Stabilization: ON (CameraX VideoCapture)"
+            else -> "Stabilization: ON (CameraX HW unsupported on lens, using software/OIS fallback)"
+        }
+        showToast(msg)
     }
 
     fun setExposureMode(mode: ExposureMode) {
@@ -250,11 +291,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             }
         } else {
             engine.startRecording(
-                onSuccess = { file ->
-                    showToast("Recording @ ${_fpsMode.value.fps} FPS [${_stabilizationMode.value.label}]")
+                onSuccess = { _ ->
+                    val stabTag = if (_isHardwareStabilizationEnabled.value) "HW Stab ON" else "Stab OFF"
+                    showToast("Recording @ ${_fpsMode.value.fps} FPS [$stabTag]")
                 },
                 onError = { err ->
                     showToast("Recording error: $err")
+                },
+                onClipFinalized = { clip ->
+                    repository.addClip(clip)
+                    showToast("Saved ${clip.durationSeconds}s @ ${clip.fps} FPS")
                 }
             )
         }

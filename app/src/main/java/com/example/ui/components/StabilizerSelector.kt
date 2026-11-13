@@ -5,8 +5,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MotionPhotosOn
@@ -34,6 +36,9 @@ fun StabilizerSelector(
     onClose: () -> Unit
 ) {
     val activeMode by viewModel.stabilizationMode.collectAsState()
+    val isHwStabEnabled by viewModel.isHardwareStabilizationEnabled.collectAsState()
+    val isHwStabSupported by viewModel.isHardwareStabilizationSupported.collectAsState()
+    val isHwStabActive by viewModel.isHardwareStabilizationActive.collectAsState()
     val rollDegrees by viewModel.rollDegrees.collectAsState()
     val pitchDegrees by viewModel.pitchDegrees.collectAsState()
     val damping by viewModel.stabilizerDamping.collectAsState()
@@ -52,6 +57,7 @@ fun StabilizerSelector(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(16.dp)
+                .verticalScroll(rememberScrollState())
         ) {
             // Header
             Row(
@@ -193,6 +199,58 @@ fun StabilizerSelector(
             }
 
             Spacer(modifier = Modifier.height(14.dp))
+
+            // CameraX VideoCapture Hardware-Accelerated Video Stabilization Toggle
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(
+                        if (isHwStabEnabled) CinemaCyan.copy(alpha = 0.14f)
+                        else CinemaElevatedSurface
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (isHwStabEnabled) CinemaCyan else CinemaBorder,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    .clickable { viewModel.toggleHardwareStabilization(!isHwStabEnabled) }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        text = "Hardware-Accelerated Stabilization",
+                        color = if (isHwStabEnabled) CinemaCyan else CinemaTextPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = when {
+                            !isHwStabSupported -> "CameraX VideoCapture HW stab unsupported on lens (OIS/EIS fallback)"
+                            isHwStabActive -> "CameraX VideoCapture stabilization ACTIVE"
+                            else -> "CameraX VideoCapture stabilization OFF (raw sensor)"
+                        },
+                        color = CinemaTextSecondary,
+                        fontSize = 11.sp
+                    )
+                }
+                Switch(
+                    checked = isHwStabEnabled,
+                    onCheckedChange = { viewModel.toggleHardwareStabilization(it) },
+                    modifier = Modifier.testTag("hw_stabilization_switch"),
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = CinemaBlack,
+                        checkedTrackColor = CinemaCyan,
+                        uncheckedThumbColor = CinemaTextSecondary,
+                        uncheckedTrackColor = CinemaDarkSurface
+                    )
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
 
             // Modes List
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {

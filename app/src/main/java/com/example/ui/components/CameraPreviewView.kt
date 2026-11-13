@@ -5,10 +5,15 @@ import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MotionPhotosOff
+import androidx.compose.material.icons.filled.MotionPhotosOn
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -21,6 +26,8 @@ import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -48,6 +55,8 @@ fun CameraPreviewView(
     val audioDb by viewModel.audioDb.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
     val stabilizerMode by viewModel.stabilizationMode.collectAsState()
+    val isHwStabEnabled by viewModel.isHardwareStabilizationEnabled.collectAsState()
+    val isHwStabSupported by viewModel.isHardwareStabilizationSupported.collectAsState()
 
     var tapFocusPoint by remember { mutableStateOf<Offset?>(null) }
 
@@ -143,10 +152,13 @@ fun CameraPreviewView(
             )
         }
 
-        // Stabilizer Indicator Badge
+        // Interactive CameraX VideoCapture Hardware Stabilization Toggle Pill
         StabilizerActiveBadge(
             modeLabel = stabilizerMode.label,
+            isHwStabEnabled = isHwStabEnabled,
+            isHwStabSupported = isHwStabSupported,
             isRecording = isRecording,
+            onToggle = { viewModel.toggleHardwareStabilization() },
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(top = 80.dp, start = 12.dp)
@@ -229,30 +241,63 @@ fun LiveFilterCanvasOverlay(colorFilter: ColorFilterType, modifier: Modifier = M
 @Composable
 fun StabilizerActiveBadge(
     modeLabel: String,
+    isHwStabEnabled: Boolean,
+    isHwStabSupported: Boolean,
     isRecording: Boolean,
+    onToggle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val activeColor = when {
+        isRecording && isHwStabEnabled -> CinemaRed
+        isHwStabEnabled && isHwStabSupported -> CinemaCyan
+        isHwStabEnabled -> CinemaAmber
+        else -> CinemaTextMuted
+    }
+    val statusText = when {
+        !isHwStabEnabled -> "HW STAB: OFF"
+        isHwStabSupported -> "HW STAB: $modeLabel"
+        else -> "STAB: $modeLabel"
+    }
+
     Row(
         modifier = modifier
-            .clip(RoundedCornerShape(6.dp))
-            .background(CinemaDarkSurface.copy(alpha = 0.85f))
-            .border(1.dp, CinemaBorder, RoundedCornerShape(6.dp))
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .defaultMinSize(minHeight = 48.dp)
+            .semantics(mergeDescendants = true) {}
+            .clickable(onClick = onToggle)
+            .testTag("hw_stabilization_toggle")
+            .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(
+        Row(
             modifier = Modifier
-                .size(8.dp)
-                .clip(CircleShape)
-                .background(if (isRecording) CinemaRed else CinemaCyan)
-        )
-        Spacer(modifier = Modifier.width(6.dp))
-        Text(
-            text = "STAB: $modeLabel",
-            color = CinemaTextPrimary,
-            fontSize = 10.sp,
-            style = MaterialTheme.typography.labelSmall
-        )
+                .clip(RoundedCornerShape(8.dp))
+                .background(
+                    if (isHwStabEnabled) CinemaDarkSurface.copy(alpha = 0.88f)
+                    else CinemaDarkSurface.copy(alpha = 0.7f)
+                )
+                .border(
+                    width = 1.dp,
+                    color = if (isHwStabEnabled) activeColor.copy(alpha = 0.65f) else CinemaBorder,
+                    shape = RoundedCornerShape(8.dp)
+                )
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = if (isHwStabEnabled) Icons.Default.MotionPhotosOn else Icons.Default.MotionPhotosOff,
+                contentDescription = if (isHwStabEnabled) "Hardware stabilization enabled" else "Hardware stabilization disabled",
+                tint = activeColor,
+                modifier = Modifier.size(14.dp)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = statusText,
+                color = if (isHwStabEnabled) CinemaTextPrimary else CinemaTextMuted,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
     }
 }
 

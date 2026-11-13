@@ -30,6 +30,7 @@ fun HardwareInfoDialog(
     onClose: () -> Unit
 ) {
     val hwInfo by viewModel.hardwareInfo.collectAsState()
+    val isCameraXStabSupported by viewModel.isHardwareStabilizationSupported.collectAsState()
 
     Card(
         modifier = Modifier
@@ -96,6 +97,11 @@ fun HardwareInfoDialog(
                 label = "Electronic Stabilization (EIS)",
                 value = if (hwInfo.supportsEis) "Available (Sensor Video Stabilization)" else "Active via Stream Damping",
                 highlight = true
+            )
+            SpecItem(
+                label = "CameraX VideoCapture HW Stabilization",
+                value = if (isCameraXStabSupported) "Supported (VideoCapabilities.isStabilizationSupported)" else "Not reported on current lens",
+                highlight = isCameraXStabSupported
             )
             SpecItem(label = "ISO Sensitivity Range", value = "${hwInfo.minIso} - ${hwInfo.maxIso}")
             SpecItem(label = "Exposure Time Range", value = "1/10000s - 1s")
