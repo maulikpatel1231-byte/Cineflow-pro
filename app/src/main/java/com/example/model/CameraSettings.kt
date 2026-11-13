@@ -20,7 +20,21 @@ enum class StabilizationMode(val label: String, val description: String, val ico
     OIS("OIS", "Optical Image Stabilization (Lens shift)", "Optical"),
     EIS("EIS", "Electronic Image Stabilization (Sensor crop)", "Electronic"),
     HYBRID("Hybrid Pro", "OIS + EIS Dual Gyro Stabilization", "Dual Pro"),
-    SUPER_EXTREME("Super Extreme", "Preview + VideoCapture + OIS/EIS + Horizon Lock", "Gimbal Ultra")
+    SUPER_EXTREME("Super Extreme", "3-Axis GL Gyro EIS + OIS + Horizon Lock + Fast Shutter", "Gimbal Ultra")
+}
+
+enum class GyroStabilizerStrength(
+    val label: String,
+    val overscanScale: Float,
+    val panFollowRateHz: Float,
+    val rollLockMaxDeg: Float,
+    val shortBadge: String,
+    val description: String
+) {
+    OFF("Off", 1.0f, 0f, 0f, "OFF", "No digital gyro frame warping"),
+    SMOOTH("Smooth (1.12x)", 1.12f, 2.4f, 4.0f, "1.12x", "Light walking stabilization with minimal crop"),
+    ACTION("Action Extreme (1.22x)", 1.22f, 1.35f, 8.0f, "1.22x", "Heavy hand-shake & running cancellation"),
+    LOCKDOWN("Gimbal Lockdown (1.32x)", 1.32f, 0.80f, 12.5f, "1.32x", "Maximum 3-axis shake lock for violent motion")
 }
 
 enum class ExposureMode(val label: String) {

@@ -41,6 +41,12 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _stabilizationMode = MutableStateFlow(StabilizationMode.HYBRID)
     val stabilizationMode: StateFlow<StabilizationMode> = _stabilizationMode.asStateFlow()
 
+    private val _gyroStabilizerStrength = MutableStateFlow(GyroStabilizerStrength.ACTION)
+    val gyroStabilizerStrength: StateFlow<GyroStabilizerStrength> = _gyroStabilizerStrength.asStateFlow()
+
+    private val _isAntiBlurShutterEnabled = MutableStateFlow(true)
+    val isAntiBlurShutterEnabled: StateFlow<Boolean> = _isAntiBlurShutterEnabled.asStateFlow()
+
     private val _isHardwareStabilizationEnabled = MutableStateFlow(true)
     val isHardwareStabilizationEnabled: StateFlow<Boolean> = _isHardwareStabilizationEnabled.asStateFlow()
 
@@ -50,6 +56,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     val isHardwareStabilizationSupported: StateFlow<Boolean> = engine.isHardwareStabilizationSupported
     val isPreviewStabilizationSupported: StateFlow<Boolean> = engine.isPreviewStabilizationSupported
     val isHardwareStabilizationActive: StateFlow<Boolean> = engine.isHardwareStabilizationActive
+    val isGlStabilizerActive: StateFlow<Boolean> = engine.isGlStabilizerActive
+    val shakeCancelledDegrees: StateFlow<Float> = engine.shakeCancelledDegrees
 
     private val _exposureMode = MutableStateFlow(ExposureMode.AUTO)
     val exposureMode: StateFlow<ExposureMode> = _exposureMode.asStateFlow()
@@ -169,26 +177,74 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
         val previousMode = _stabilizationMode.value
+        val previousStrength = _gyroStabilizerStrength.value
         _stabilizationMode.value = mode
         engine.stabilizationMode = mode
+
+        val nextStrength = when (mode) {
+            StabilizationMode.OFF -> GyroStabilizerStrength.OFF
+            StabilizationMode.OIS -> GyroStabilizerStrength.OFF
+            StabilizationMode.EIS -> GyroStabilizerStrength.SMOOTH
+            StabilizationMode.HYBRID -> GyroStabilizerStrength.ACTION
+            StabilizationMode.SUPER_EXTREME -> GyroStabilizerStrength.LOCKDOWN
+        }
+        _gyroStabilizerStrength.value = nextStrength
+        engine.gyroStabilizerStrength = nextStrength
+
         val shouldEnableHw = mode != StabilizationMode.OFF
+        val glAttachmentChanged = (previousStrength == GyroStabilizerStrength.OFF) != (nextStrength == GyroStabilizerStrength.OFF)
         val needsRebind =
             _isHardwareStabilizationEnabled.value != shouldEnableHw ||
                 previousMode == StabilizationMode.SUPER_EXTREME ||
-                mode == StabilizationMode.SUPER_EXTREME
+                mode == StabilizationMode.SUPER_EXTREME ||
+                glAttachmentChanged
         _isHardwareStabilizationEnabled.value = shouldEnableHw
         engine.isHardwareVideoStabilizationEnabled = shouldEnableHw
+        engine.syncGyroFilterConfig(shouldEnableHw)
         if (needsRebind) {
             engine.bindCameraUseCases()
         } else {
             engine.updateLiveControls()
         }
         val toastText = if (mode == StabilizationMode.SUPER_EXTREME) {
-            "Super Extreme Gimbal Stability ON"
+            "Super Extreme 3-Axis Gimbal Lockdown ON"
         } else {
-            "Stabilizer: ${mode.label}"
+            "Stabilizer: ${mode.label} (${nextStrength.shortBadge} Gyro)"
         }
         showToast(toastText)
+    }
+
+    fun setGyroStabilizerStrength(strength: GyroStabilizerStrength) {
+        val wasOff = _gyroStabilizerStrength.value == GyroStabilizerStrength.OFF
+        val nowOff = strength == GyroStabilizerStrength.OFF
+        if ((wasOff != nowOff) && isRecording.value) {
+            showToast("Stop recording to toggle GL Gyro EIS on/off")
+            return
+        }
+        _gyroStabilizerStrength.value = strength
+        engine.gyroStabilizerStrength = strength
+        if (!nowOff && _stabilizationMode.value == StabilizationMode.OFF) {
+            _stabilizationMode.value = StabilizationMode.HYBRID
+            engine.stabilizationMode = StabilizationMode.HYBRID
+            _isHardwareStabilizationEnabled.value = true
+            engine.isHardwareVideoStabilizationEnabled = true
+        }
+        engine.syncGyroFilterConfig()
+        if (wasOff != nowOff) {
+            engine.bindCameraUseCases()
+        }
+        showToast("Recorded Gyro EIS: ${strength.label}")
+    }
+
+    fun toggleAntiBlurShutter(enabled: Boolean = !_isAntiBlurShutterEnabled.value) {
+        if (isRecording.value) {
+            showToast("Stop recording to adjust anti-blur shutter floor")
+            return
+        }
+        _isAntiBlurShutterEnabled.value = enabled
+        engine.isAntiBlurShutterEnabled = enabled
+        engine.bindCameraUseCases()
+        showToast(if (enabled) "Anti-Motion-Blur Fast Shutter: ON" else "Anti-Motion-Blur Shutter: OFF")
     }
 
     fun toggleSuperExtremeStability() {
@@ -203,7 +259,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleHorizonLock(enabled: Boolean = !_isHorizonLockEnabled.value) {
         _isHorizonLockEnabled.value = enabled
         engine.isHorizonLockEnabled = enabled
-        showToast(if (enabled) "Active Horizon Lock: ON (±18°)" else "Active Horizon Lock: OFF")
+        engine.syncGyroFilterConfig()
+        showToast(if (enabled) "Active Horizon Lock: ON" else "Active Horizon Lock: OFF")
     }
 
     fun toggleHardwareStabilization(enabled: Boolean = !_isHardwareStabilizationEnabled.value) {
@@ -216,16 +273,21 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         if (enabled && _stabilizationMode.value == StabilizationMode.OFF) {
             _stabilizationMode.value = StabilizationMode.HYBRID
             engine.stabilizationMode = StabilizationMode.HYBRID
+            _gyroStabilizerStrength.value = GyroStabilizerStrength.ACTION
+            engine.gyroStabilizerStrength = GyroStabilizerStrength.ACTION
         } else if (!enabled && _stabilizationMode.value != StabilizationMode.OFF) {
             _stabilizationMode.value = StabilizationMode.OFF
             engine.stabilizationMode = StabilizationMode.OFF
+            _gyroStabilizerStrength.value = GyroStabilizerStrength.OFF
+            engine.gyroStabilizerStrength = GyroStabilizerStrength.OFF
         }
+        engine.syncGyroFilterConfig()
         engine.bindCameraUseCases()
         val hwSupported = isHardwareStabilizationSupported.value
         val msg = when {
-            !enabled -> "Hardware Video Stabilization: OFF"
-            hwSupported -> "Hardware Video Stabilization: ON (CameraX VideoCapture)"
-            else -> "Stabilization: ON (CameraX HW unsupported on lens, using software/OIS fallback)"
+            !enabled -> "Video Stabilization: OFF"
+            hwSupported -> "Hardware + GL Gyro Stabilization: ON"
+            else -> "GL Gyro Stabilization: ON (3-Axis Recorded EIS)"
         }
         showToast(msg)
     }

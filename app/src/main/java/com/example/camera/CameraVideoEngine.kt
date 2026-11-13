@@ -20,8 +20,10 @@ import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
@@ -58,6 +60,8 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
     private var activeRecording: Recording? = null
     private var currentLifecycleOwner: LifecycleOwner? = null
     private var currentPreviewView: PreviewView? = null
+    private var gyroProcessor: GyroStabilizerSurfaceProcessor? = null
+    private val gyroFilter = GyroStabilizerFilter()
 
     // Sensors for Level / Stabilizer
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
@@ -87,6 +91,9 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
     private val _stabilityScore = MutableStateFlow(94)
     val stabilityScore: StateFlow<Int> = _stabilityScore.asStateFlow()
 
+    private val _shakeCancelledDegrees = MutableStateFlow(0f)
+    val shakeCancelledDegrees: StateFlow<Float> = _shakeCancelledDegrees.asStateFlow()
+
     // CameraX VideoCapture & Preview hardware-accelerated stabilization capability & active state
     private val _isHardwareStabilizationSupported = MutableStateFlow(true)
     val isHardwareStabilizationSupported: StateFlow<Boolean> = _isHardwareStabilizationSupported.asStateFlow()
@@ -96,6 +103,9 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
     private val _isHardwareStabilizationActive = MutableStateFlow(false)
     val isHardwareStabilizationActive: StateFlow<Boolean> = _isHardwareStabilizationActive.asStateFlow()
+
+    private val _isGlStabilizerActive = MutableStateFlow(false)
+    val isGlStabilizerActive: StateFlow<Boolean> = _isGlStabilizerActive.asStateFlow()
 
     // Low-pass filter state for ultra-smooth gyro damping
     private var filteredRoll = 0f
@@ -125,6 +135,8 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
     var fpsMode: FpsMode = FpsMode.FPS_120
     var resolutionMode: ResolutionMode = ResolutionMode.FHD_1080P
     var stabilizationMode: StabilizationMode = StabilizationMode.HYBRID
+    var gyroStabilizerStrength: GyroStabilizerStrength = GyroStabilizerStrength.ACTION
+    var isAntiBlurShutterEnabled: Boolean = true
     var isHardwareVideoStabilizationEnabled: Boolean = true
     var isHorizonLockEnabled: Boolean = true
     var exposureMode: ExposureMode = ExposureMode.AUTO
@@ -159,7 +171,7 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
         gyroscopeSensor?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
         }
     }
 
@@ -185,13 +197,16 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
     @SuppressLint("UnsafeOptInUsageError")
     @OptIn(ExperimentalCamera2Interop::class)
-    fun bindCameraUseCases() {
+    fun bindCameraUseCases(allowGlEffect: Boolean = true) {
         val provider = cameraProvider ?: return
         val lifecycleOwner = currentLifecycleOwner ?: return
         val previewView = currentPreviewView ?: return
 
         try {
             provider.unbindAll()
+            gyroProcessor?.release()
+            gyroProcessor = null
+            _isGlStabilizerActive.value = false
 
             val cameraSelector = if (isFrontCamera) {
                 CameraSelector.DEFAULT_FRONT_CAMERA
@@ -224,9 +239,20 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             val camera2Config = Camera2Interop.Extender(previewBuilder)
 
             val targetFps = fpsMode.fps
+            val minAeFps = if (
+                isAntiBlurShutterEnabled &&
+                gyroStabilizerStrength != GyroStabilizerStrength.OFF
+            ) {
+                when {
+                    targetFps >= 60 -> 60
+                    else -> 30
+                }
+            } else {
+                targetFps.coerceAtMost(60)
+            }
             camera2Config.setCaptureRequestOption(
                 CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                Range(targetFps.coerceAtMost(60), targetFps)
+                Range(minAeFps.coerceAtMost(targetFps), targetFps)
             )
             camera2Config.setCaptureRequestOption(
                 CaptureRequest.CONTROL_CAPTURE_INTENT,
@@ -258,7 +284,9 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 FpsMode.FPS_60 -> 24_000_000
                 FpsMode.FPS_30 -> 16_000_000
             }
-            val bitRate = if (stabilizationMode == StabilizationMode.SUPER_EXTREME) {
+            val bitRate = if (stabilizationMode == StabilizationMode.SUPER_EXTREME ||
+                gyroStabilizerStrength == GyroStabilizerStrength.LOCKDOWN
+            ) {
                 (baseBitRate * 1.25).toInt()
             } else {
                 baseBitRate
@@ -274,23 +302,102 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
             videoCaptureUseCase = videoCaptureBuilder.build()
 
-            camera = provider.bindToLifecycle(
-                lifecycleOwner,
-                cameraSelector,
-                previewUseCase,
-                videoCaptureUseCase
-            )
+            val shouldAttachGlEffect = allowGlEffect &&
+                stabilizationMode != StabilizationMode.OFF &&
+                gyroStabilizerStrength != GyroStabilizerStrength.OFF
+
+            if (shouldAttachGlEffect) {
+                val sensorOrient = selectedCameraInfo?.sensorRotationDegrees
+                    ?: if (isFrontCamera) 270 else 90
+                syncGyroFilterConfig(shouldEnableHwStabilization)
+                gyroFilter.reset()
+
+                val processor = GyroStabilizerSurfaceProcessor(
+                    filter = gyroFilter,
+                    onShakeTelemetry = { deg -> _shakeCancelledDegrees.value = deg },
+                    onFatalGlError = { err ->
+                        Log.w(TAG, "GL Gyro Stabilizer runtime error, falling back cleanly", err)
+                        coroutineScope.launch {
+                            if (_isGlStabilizerActive.value && !_isRecording.value) {
+                                bindCameraUseCases(allowGlEffect = false)
+                            }
+                        }
+                    }
+                ).apply {
+                    sensorOrientationDegrees = sensorOrient
+                    isFrontCamera = this@CameraVideoEngine.isFrontCamera
+                }
+                gyroProcessor = processor
+
+                val effect = GyroStabilizerEffect(
+                    executor = processor.glExecutor,
+                    surfaceProcessor = processor
+                ) { throwable ->
+                    Log.w(TAG, "CameraEffect error", throwable)
+                }
+
+                val useCaseGroup = UseCaseGroup.Builder()
+                    .addUseCase(previewUseCase!!)
+                    .addUseCase(videoCaptureUseCase!!)
+                    .addEffect(effect)
+                    .build()
+
+                try {
+                    camera = provider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,
+                        useCaseGroup
+                    )
+                    _isGlStabilizerActive.value = true
+                } catch (glBindError: Exception) {
+                    Log.w(TAG, "UseCaseGroup GL Gyro CameraEffect unsupported on stream, binding direct", glBindError)
+                    processor.release()
+                    gyroProcessor = null
+                    _isGlStabilizerActive.value = false
+                    camera = provider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,
+                        previewUseCase,
+                        videoCaptureUseCase
+                    )
+                }
+            } else {
+                camera = provider.bindToLifecycle(
+                    lifecycleOwner,
+                    cameraSelector,
+                    previewUseCase,
+                    videoCaptureUseCase
+                )
+            }
 
             camera?.cameraControl?.enableTorch(isFlashTorchOn)
 
             Log.d(
                 TAG,
-                "Camera bound with VideoCapture | FPS: ${fpsMode.fps} | Mode: ${stabilizationMode.name} | HW Stab: $shouldEnableHwStabilization | Preview Stab: $shouldEnablePreviewStabilization"
+                "Camera bound | FPS: ${fpsMode.fps} | Mode: ${stabilizationMode.name} | GL Gyro EIS: ${_isGlStabilizerActive.value} (${gyroStabilizerStrength.shortBadge}) | HW Stab: $shouldEnableHwStabilization | Preview Stab: $shouldEnablePreviewStabilization"
             )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind Preview + VideoCapture, attempting Preview-only fallback", e)
             bindPreviewOnlyFallback(provider, lifecycleOwner, previewView)
         }
+    }
+
+    fun syncGyroFilterConfig(hwStabActive: Boolean = _isHardwareStabilizationActive.value) {
+        gyroFilter.strength = if (stabilizationMode == StabilizationMode.OFF) {
+            GyroStabilizerStrength.OFF
+        } else {
+            gyroStabilizerStrength
+        }
+        gyroFilter.isHorizonLockEnabled = isHorizonLockEnabled &&
+            (stabilizationMode == StabilizationMode.SUPER_EXTREME ||
+                gyroStabilizerStrength == GyroStabilizerStrength.ACTION ||
+                gyroStabilizerStrength == GyroStabilizerStrength.LOCKDOWN)
+        // If HAL EIS is also active, blend GL Gyro gain to 0.70x so it absorbs large shakes & horizon tilt without double-correcting small jitter.
+        // If HAL EIS is off/unsupported, engage full 1.05x GL Gyro lock.
+        val hasHalEis = hwStabActive &&
+            stabilizationMode != StabilizationMode.OIS &&
+            stabilizationMode != StabilizationMode.OFF
+        gyroFilter.gainMultiplier = if (hasHalEis) 0.70f else 1.05f
     }
 
     @OptIn(ExperimentalCamera2Interop::class)
@@ -769,10 +876,14 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
         val shutterText = shutterSpeeds.getOrNull(manualShutterSpeedIndex)?.first ?: "Auto"
         val sizeFormatted = formatFileSize(file.length())
-        val stabLabel = if (isHardwareVideoStabilizationEnabled) {
-            "${stabilizationMode.label} (HW)"
-        } else {
-            "Off"
+        val stabLabel = buildString {
+            append(stabilizationMode.label)
+            if (_isGlStabilizerActive.value && gyroStabilizerStrength != GyroStabilizerStrength.OFF) {
+                append(" + GL Gyro ${gyroStabilizerStrength.shortBadge}")
+            }
+            if (_isHardwareStabilizationActive.value) {
+                append(" (HW)")
+            }
         }
 
         return VideoClip(
@@ -810,7 +921,10 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             val rawPitch = Math.toDegrees(orientation[1].toDouble()).toFloat()
             val rawRoll = -Math.toDegrees(orientation[2].toDouble()).toFloat()
 
-            // Complementary low-pass smoothing for gimbal horizon lock
+            // Feed true gravity roll into the real-time GL gyro horizon lock filter
+            gyroFilter.onRotationRollSample(rawRoll)
+
+            // Complementary low-pass smoothing for UI telemetry & fallback horizon lock
             val alpha = if (stabilizationMode == StabilizationMode.SUPER_EXTREME) 0.14f else 0.25f
             filteredPitch = filteredPitch * (1f - alpha) + rawPitch * alpha
             filteredRoll = filteredRoll * (1f - alpha) + rawRoll * alpha
@@ -827,19 +941,26 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             }
 
             val baseEfficiency = when {
-                !isHardwareVideoStabilizationEnabled || stabilizationMode == StabilizationMode.OFF -> 0.42f
-                stabilizationMode == StabilizationMode.SUPER_EXTREME -> 0.99f
+                stabilizationMode == StabilizationMode.OFF -> 0.40f
+                _isGlStabilizerActive.value && gyroStabilizerStrength == GyroStabilizerStrength.LOCKDOWN -> 0.99f
+                _isGlStabilizerActive.value && gyroStabilizerStrength == GyroStabilizerStrength.ACTION -> 0.96f
+                stabilizationMode == StabilizationMode.SUPER_EXTREME -> 0.98f
                 stabilizationMode == StabilizationMode.HYBRID -> 0.93f
-                else -> 0.84f
+                else -> 0.85f
             }
             val motionPenalty = (rollDelta / 60f).coerceIn(0f, 0.15f)
-            val eff = (baseEfficiency - (if (isExtreme) motionPenalty * 0.2f else motionPenalty)).coerceIn(0.35f, 0.99f)
+            val eff = (baseEfficiency - (if (isExtreme || _isGlStabilizerActive.value) motionPenalty * 0.15f else motionPenalty)).coerceIn(0.35f, 0.99f)
             _stabilizerDamping.value = eff
             _stabilityScore.value = (eff * 100).roundToInt()
         } else if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
             val gx = event.values[0] // pitch velocity rad/s
-            val gy = event.values[1] // roll/yaw velocity rad/s
-            // High-pass / decaying micro-jitter compensation
+            val gy = event.values[1] // yaw velocity rad/s
+            val gz = event.values[2] // roll velocity rad/s
+
+            // Feed exact nanosecond gyro velocity straight into the GL Recorded EIS integrator
+            gyroFilter.onGyroSample(gx, gy, gz, event.timestamp)
+
+            // High-pass / decaying micro-jitter compensation for fallback UI preview
             gyroVelX = gyroVelX * 0.72f + gy * 0.28f
             gyroVelY = gyroVelY * 0.72f + gx * 0.28f
 
@@ -855,6 +976,7 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             val ay = event.values[1]
             val az = event.values[2]
             val roll = Math.toDegrees(atan2(ax.toDouble(), sqrt(ay.toDouble() * ay + az.toDouble() * az))).toFloat()
+            gyroFilter.onRotationRollSample(roll)
             filteredRoll = filteredRoll * 0.85f + roll * 0.15f
             _rollDegrees.value = filteredRoll
             val isExtreme = stabilizationMode == StabilizationMode.SUPER_EXTREME && isHardwareVideoStabilizationEnabled
@@ -871,6 +993,8 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
     fun release() {
         sensorManager?.unregisterListener(this)
         coroutineScope.cancel()
+        gyroProcessor?.release()
+        gyroProcessor = null
         try {
             activeRecording?.stop()
         } catch (_: Exception) {

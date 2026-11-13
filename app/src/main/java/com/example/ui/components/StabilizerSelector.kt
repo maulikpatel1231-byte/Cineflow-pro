@@ -26,6 +26,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.model.GyroStabilizerStrength
 import com.example.model.StabilizationMode
 import com.example.ui.theme.*
 import com.example.viewmodel.CameraViewModel
@@ -36,6 +37,10 @@ fun StabilizerSelector(
     onClose: () -> Unit
 ) {
     val activeMode by viewModel.stabilizationMode.collectAsState()
+    val gyroStrength by viewModel.gyroStabilizerStrength.collectAsState()
+    val isGlStabilizerActive by viewModel.isGlStabilizerActive.collectAsState()
+    val shakeCancelledDegrees by viewModel.shakeCancelledDegrees.collectAsState()
+    val isAntiBlurEnabled by viewModel.isAntiBlurShutterEnabled.collectAsState()
     val isHwStabEnabled by viewModel.isHardwareStabilizationEnabled.collectAsState()
     val isHwStabSupported by viewModel.isHardwareStabilizationSupported.collectAsState()
     val isPreviewStabSupported by viewModel.isPreviewStabilizationSupported.collectAsState()
@@ -44,7 +49,6 @@ fun StabilizerSelector(
     val stabilityScore by viewModel.stabilityScore.collectAsState()
     val rollDegrees by viewModel.rollDegrees.collectAsState()
     val pitchDegrees by viewModel.pitchDegrees.collectAsState()
-    val damping by viewModel.stabilizerDamping.collectAsState()
     val hwInfo by viewModel.hardwareInfo.collectAsState()
 
     Card(
@@ -198,10 +202,87 @@ fun StabilizerSelector(
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Bold
                     )
+                    Text(
+                        text = if (isGlStabilizerActive) {
+                            "GL Rec: -${String.format("%.1f", shakeCancelledDegrees)}°"
+                        } else {
+                            "GL Rec: Bypass"
+                        },
+                        color = if (isGlStabilizerActive) CinemaGreen else CinemaTextMuted,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Medium
+                    )
                 }
             }
 
             Spacer(modifier = Modifier.height(14.dp))
+
+            // Recorded Video 3-Axis GL Gyro-EIS Strength Selector
+            Text(
+                text = "RECORDED VIDEO 3-AXIS GYRO EIS CROP",
+                color = CinemaTextMuted,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.5.sp
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                GyroStabilizerStrength.values().forEach { strength ->
+                    val selected = gyroStrength == strength
+                    val chipColor = when (strength) {
+                        GyroStabilizerStrength.LOCKDOWN -> CinemaGreen
+                        GyroStabilizerStrength.ACTION -> CinemaCyan
+                        GyroStabilizerStrength.SMOOTH -> CinemaAmber
+                        GyroStabilizerStrength.OFF -> CinemaTextMuted
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .defaultMinSize(minHeight = 48.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (selected) chipColor.copy(alpha = 0.2f) else CinemaElevatedSurface)
+                            .border(
+                                width = if (selected) 1.5.dp else 1.dp,
+                                color = if (selected) chipColor else CinemaBorder,
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clickable { viewModel.setGyroStabilizerStrength(strength) }
+                            .testTag("gyro_strength_${strength.name.lowercase()}")
+                            .padding(horizontal = 4.dp, vertical = 6.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = strength.shortBadge,
+                                color = if (selected) chipColor else CinemaTextPrimary,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = when (strength) {
+                                    GyroStabilizerStrength.OFF -> "Raw"
+                                    GyroStabilizerStrength.SMOOTH -> "Walk"
+                                    GyroStabilizerStrength.ACTION -> "Run"
+                                    GyroStabilizerStrength.LOCKDOWN -> "Max"
+                                },
+                                color = CinemaTextMuted,
+                                fontSize = 9.sp
+                            )
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = gyroStrength.description,
+                color = CinemaTextSecondary,
+                fontSize = 11.sp
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
 
             // CameraX VideoCapture Hardware-Accelerated Video Stabilization Toggle
             Row(
@@ -302,6 +383,55 @@ fun StabilizerSelector(
                     colors = SwitchDefaults.colors(
                         checkedThumbColor = CinemaBlack,
                         checkedTrackColor = CinemaGreen,
+                        uncheckedThumbColor = CinemaTextSecondary,
+                        uncheckedTrackColor = CinemaDarkSurface
+                    )
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Anti-Motion-Blur Fast Shutter Floor Toggle
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .defaultMinSize(minHeight = 48.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(
+                        if (isAntiBlurEnabled) CinemaAmber.copy(alpha = 0.14f)
+                        else CinemaElevatedSurface
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (isAntiBlurEnabled) CinemaAmber else CinemaBorder,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    .clickable { viewModel.toggleAntiBlurShutter(!isAntiBlurEnabled) }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        text = "Anti-Blur Fast Shutter Floor",
+                        color = if (isAntiBlurEnabled) CinemaAmber else CinemaTextPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "Eliminates EIS shake smear by holding crisp shutter speeds",
+                        color = CinemaTextSecondary,
+                        fontSize = 11.sp
+                    )
+                }
+                Switch(
+                    checked = isAntiBlurEnabled,
+                    onCheckedChange = { viewModel.toggleAntiBlurShutter(it) },
+                    modifier = Modifier.testTag("anti_blur_shutter_switch"),
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = CinemaBlack,
+                        checkedTrackColor = CinemaAmber,
                         uncheckedThumbColor = CinemaTextSecondary,
                         uncheckedTrackColor = CinemaDarkSurface
                     )

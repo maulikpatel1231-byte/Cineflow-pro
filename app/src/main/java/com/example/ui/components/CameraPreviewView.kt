@@ -39,6 +39,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.model.ColorFilterType
 import com.example.model.GridType
+import com.example.model.GyroStabilizerStrength
 import com.example.model.StabilizationMode
 import com.example.ui.theme.*
 import com.example.viewmodel.CameraViewModel
@@ -61,6 +62,9 @@ fun CameraPreviewView(
     val audioDb by viewModel.audioDb.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
     val stabilizerMode by viewModel.stabilizationMode.collectAsState()
+    val gyroStrength by viewModel.gyroStabilizerStrength.collectAsState()
+    val isGlStabilizerActive by viewModel.isGlStabilizerActive.collectAsState()
+    val shakeCancelledDegrees by viewModel.shakeCancelledDegrees.collectAsState()
     val isHwStabEnabled by viewModel.isHardwareStabilizationEnabled.collectAsState()
     val isHwStabSupported by viewModel.isHardwareStabilizationSupported.collectAsState()
     val isHorizonLockEnabled by viewModel.isHorizonLockEnabled.collectAsState()
@@ -70,14 +74,17 @@ fun CameraPreviewView(
     val stabilityScore by viewModel.stabilityScore.collectAsState()
 
     val isSuperExtremeActive = stabilizerMode == StabilizationMode.SUPER_EXTREME && isHwStabEnabled
-    val targetScale = if (isSuperExtremeActive && isHorizonLockEnabled) 1.18f else if (isSuperExtremeActive) 1.08f else 1.0f
+    // When CameraEffect GL Gyro EIS is active, the GPU SurfaceProcessor already stabilizes both Preview and recorded VideoCapture frames.
+    // Only apply Compose graphicsLayer compensation as a fallback when GL CameraEffect is not bound.
+    val useComposeFallbackCompensation = !isGlStabilizerActive && isSuperExtremeActive
+    val targetScale = if (useComposeFallbackCompensation && isHorizonLockEnabled) 1.18f else if (useComposeFallbackCompensation) 1.08f else 1.0f
     val animatedScale by animateFloatAsState(
         targetValue = targetScale,
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "gimbal_overscan"
     )
     val animatedRotation by animateFloatAsState(
-        targetValue = if (isSuperExtremeActive && isHorizonLockEnabled) horizonLockAngle else 0f,
+        targetValue = if (useComposeFallbackCompensation && isHorizonLockEnabled) horizonLockAngle else 0f,
         animationSpec = spring(stiffness = Spring.StiffnessMedium),
         label = "horizon_lock_rotation"
     )
@@ -125,8 +132,8 @@ fun CameraPreviewView(
                     scaleX = animatedScale
                     scaleY = animatedScale
                     rotationZ = animatedRotation
-                    translationX = if (isSuperExtremeActive) shakeCompX else 0f
-                    translationY = if (isSuperExtremeActive) shakeCompY else 0f
+                    translationX = if (useComposeFallbackCompensation) shakeCompX else 0f
+                    translationY = if (useComposeFallbackCompensation) shakeCompY else 0f
                 }
         )
 
@@ -197,12 +204,17 @@ fun CameraPreviewView(
                 modeLabel = stabilizerMode.label,
                 isHwStabEnabled = isHwStabEnabled,
                 isHwStabSupported = isHwStabSupported,
+                isGlStabilizerActive = isGlStabilizerActive,
+                gyroStrength = gyroStrength,
                 isRecording = isRecording,
                 onToggle = { viewModel.toggleHardwareStabilization() }
             )
             SuperExtremePill(
                 isActive = isSuperExtremeActive,
+                isGlStabilizerActive = isGlStabilizerActive,
+                gyroStrength = gyroStrength,
                 stabilityScore = stabilityScore,
+                shakeCancelledDegrees = shakeCancelledDegrees,
                 isHorizonLockEnabled = isHorizonLockEnabled,
                 onToggle = { viewModel.toggleSuperExtremeStability() }
             )
@@ -287,18 +299,26 @@ fun StabilizerActiveBadge(
     modeLabel: String,
     isHwStabEnabled: Boolean,
     isHwStabSupported: Boolean,
+    isGlStabilizerActive: Boolean,
+    gyroStrength: GyroStabilizerStrength,
     isRecording: Boolean,
     onToggle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val anyStabActive = isHwStabEnabled || isGlStabilizerActive
     val activeColor = when {
-        isRecording && isHwStabEnabled -> CinemaRed
+        isRecording && anyStabActive -> CinemaRed
+        isGlStabilizerActive -> CinemaGreen
         isHwStabEnabled && isHwStabSupported -> CinemaCyan
         isHwStabEnabled -> CinemaAmber
         else -> CinemaTextMuted
     }
     val statusText = when {
-        !isHwStabEnabled -> "HW STAB: OFF"
+        !anyStabActive -> "STAB: OFF"
+        isGlStabilizerActive && isHwStabEnabled && isHwStabSupported ->
+            "REC HW+GL ${gyroStrength.shortBadge}: $modeLabel"
+        isGlStabilizerActive ->
+            "REC GL GYRO ${gyroStrength.shortBadge}: $modeLabel"
         isHwStabSupported -> "HW STAB: $modeLabel"
         else -> "STAB: $modeLabel"
     }
@@ -316,27 +336,27 @@ fun StabilizerActiveBadge(
             modifier = Modifier
                 .clip(RoundedCornerShape(8.dp))
                 .background(
-                    if (isHwStabEnabled) CinemaDarkSurface.copy(alpha = 0.88f)
+                    if (anyStabActive) CinemaDarkSurface.copy(alpha = 0.88f)
                     else CinemaDarkSurface.copy(alpha = 0.7f)
                 )
                 .border(
                     width = 1.dp,
-                    color = if (isHwStabEnabled) activeColor.copy(alpha = 0.65f) else CinemaBorder,
+                    color = if (anyStabActive) activeColor.copy(alpha = 0.65f) else CinemaBorder,
                     shape = RoundedCornerShape(8.dp)
                 )
                 .padding(horizontal = 10.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector = if (isHwStabEnabled) Icons.Default.MotionPhotosOn else Icons.Default.MotionPhotosOff,
-                contentDescription = if (isHwStabEnabled) "Hardware stabilization enabled" else "Hardware stabilization disabled",
+                imageVector = if (anyStabActive) Icons.Default.MotionPhotosOn else Icons.Default.MotionPhotosOff,
+                contentDescription = if (anyStabActive) "Video stabilization enabled" else "Video stabilization disabled",
                 tint = activeColor,
                 modifier = Modifier.size(14.dp)
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
                 text = statusText,
-                color = if (isHwStabEnabled) CinemaTextPrimary else CinemaTextMuted,
+                color = if (anyStabActive) CinemaTextPrimary else CinemaTextMuted,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Bold,
                 style = MaterialTheme.typography.labelSmall
@@ -348,11 +368,15 @@ fun StabilizerActiveBadge(
 @Composable
 fun SuperExtremePill(
     isActive: Boolean,
+    isGlStabilizerActive: Boolean,
+    gyroStrength: GyroStabilizerStrength,
     stabilityScore: Int,
+    shakeCancelledDegrees: Float,
     isHorizonLockEnabled: Boolean,
     onToggle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val highlightActive = isActive || isGlStabilizerActive
     Row(
         modifier = modifier
             .defaultMinSize(minHeight = 48.dp)
@@ -365,12 +389,12 @@ fun SuperExtremePill(
             modifier = Modifier
                 .clip(RoundedCornerShape(8.dp))
                 .background(
-                    if (isActive) CinemaGreen.copy(alpha = 0.2f)
-                    else CinemaDarkSurface.copy(alpha = 0.8f)
+                    if (isActive) CinemaGreen.copy(alpha = 0.22f)
+                    else CinemaDarkSurface.copy(alpha = 0.82f)
                 )
                 .border(
                     width = 1.dp,
-                    color = if (isActive) CinemaGreen else CinemaBorder,
+                    color = if (isActive) CinemaGreen else if (isGlStabilizerActive) CinemaCyan.copy(alpha = 0.6f) else CinemaBorder,
                     shape = RoundedCornerShape(8.dp)
                 )
                 .padding(horizontal = 10.dp, vertical = 6.dp),
@@ -378,19 +402,26 @@ fun SuperExtremePill(
         ) {
             Icon(
                 imageVector = Icons.Default.AutoFixHigh,
-                contentDescription = if (isActive) "Super Extreme stability active" else "Enable Super Extreme stability",
-                tint = if (isActive) CinemaGreen else CinemaTextSecondary,
+                contentDescription = if (isActive) "Super Extreme gimbal lockdown active" else "Enable Super Extreme gimbal lockdown",
+                tint = if (isActive) CinemaGreen else if (highlightActive) CinemaCyan else CinemaTextSecondary,
                 modifier = Modifier.size(14.dp)
             )
             Spacer(modifier = Modifier.width(6.dp))
+            val shakeText = if (shakeCancelledDegrees >= 0.4f) {
+                " • -${String.format("%.1f", shakeCancelledDegrees)}°"
+            } else {
+                ""
+            }
             Text(
                 text = if (isActive) {
                     val lockText = if (isHorizonLockEnabled) " • LOCK" else ""
-                    "EXTREME ${stabilityScore}%$lockText"
+                    "GIMBAL ${stabilityScore}%$lockText$shakeText"
+                } else if (isGlStabilizerActive) {
+                    "GYRO ${gyroStrength.shortBadge} (${stabilityScore}%)$shakeText"
                 } else {
                     "EXTREME SMOOTH"
                 },
-                color = if (isActive) CinemaGreen else CinemaTextSecondary,
+                color = if (isActive) CinemaGreen else if (highlightActive) CinemaCyan else CinemaTextSecondary,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Bold,
                 style = MaterialTheme.typography.labelSmall

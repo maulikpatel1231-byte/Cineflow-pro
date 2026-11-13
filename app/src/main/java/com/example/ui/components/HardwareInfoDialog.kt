@@ -113,6 +113,11 @@ fun HardwareInfoDialog(
                 },
                 highlight = true
             )
+            SpecItem(
+                label = "3-Axis OpenGL Recorded Video Gyro-EIS",
+                value = "Active on VideoCapture + Preview (CameraEffect GPU Pipeline)",
+                highlight = true
+            )
             SpecItem(label = "ISO Sensitivity Range", value = "${hwInfo.minIso} - ${hwInfo.maxIso}")
             SpecItem(label = "Exposure Time Range", value = "1/10000s - 1s")
             SpecItem(label = "EV Exposure Steps", value = "${hwInfo.evStep} EV (Range: ${hwInfo.minEv} to ${hwInfo.maxEv})")
