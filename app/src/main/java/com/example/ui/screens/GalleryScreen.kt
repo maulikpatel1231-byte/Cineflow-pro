@@ -121,21 +121,25 @@ fun GalleryScreen(
                         viewModel.deleteClip(selectedClip!!.id)
                     },
                     onShare = {
+                        val targetClip = selectedClip!!
                         try {
-                            val file = File(selectedClip!!.filePath)
-                            val uri = FileProvider.getUriForFile(
-                                context,
-                                "${context.packageName}.fileprovider",
-                                file
-                            )
+                            val shareUri = if (targetClip.filePath.startsWith("content://")) {
+                                Uri.parse(targetClip.filePath)
+                            } else {
+                                FileProvider.getUriForFile(
+                                    context,
+                                    "${context.packageName}.fileprovider",
+                                    File(targetClip.filePath)
+                                )
+                            }
                             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                                 type = "video/mp4"
-                                putExtra(Intent.EXTRA_STREAM, uri)
+                                putExtra(Intent.EXTRA_STREAM, shareUri)
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
                             context.startActivity(Intent.createChooser(shareIntent, "Share Video Clip"))
                         } catch (e: Exception) {
-                            viewModel.showToast("Sharing: ${selectedClip!!.title}")
+                            viewModel.showToast("Unable to share clip: ${e.message ?: "No compatible app"}")
                         }
                     }
                 )
@@ -143,7 +147,9 @@ fun GalleryScreen(
                 // Clips List
                 if (clips.isEmpty()) {
                     Box(
-                        modifier = Modifier.fillMaxSize(),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(24.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -157,11 +163,12 @@ fun GalleryScreen(
                             Text(
                                 text = "No recorded video clips yet",
                                 color = CinemaTextSecondary,
-                                fontSize = 14.sp
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold
                             )
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "Record in 120 or 240 FPS slow-mo from the viewfinder",
+                                text = "Record stabilized 30-240 FPS cinema video from the viewfinder. Clips save to Movies/CineFlowPro.",
                                 color = CinemaTextMuted,
                                 fontSize = 11.sp
                             )
@@ -296,9 +303,34 @@ fun ClipPlayerView(
     onDelete: () -> Unit,
     onShare: () -> Unit
 ) {
-    var isPlaying by remember { mutableStateOf(true) }
-    var mediaPlayerInstance by remember { mutableStateOf<MediaPlayer?>(null) }
+    var isPlaying by remember(clip.id) { mutableStateOf(true) }
+    var hasPlaybackError by remember(clip.id) { mutableStateOf(false) }
+    var mediaPlayerInstance by remember(clip.id) { mutableStateOf<MediaPlayer?>(null) }
+    var videoViewRef by remember(clip.id) { mutableStateOf<VideoView?>(null) }
     val speedOptions = listOf(0.125f, 0.25f, 0.5f, 1.0f)
+
+    DisposableEffect(clip.id) {
+        onDispose {
+            try {
+                videoViewRef?.stopPlayback()
+            } catch (_: Exception) {
+            }
+            mediaPlayerInstance = null
+        }
+    }
+
+    LaunchedEffect(speed, mediaPlayerInstance) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                mediaPlayerInstance?.let { mp ->
+                    val params = mp.playbackParams
+                    params.speed = speed
+                    mp.playbackParams = params
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -316,71 +348,94 @@ fun ClipPlayerView(
                 .border(1.dp, CinemaBorder, RoundedCornerShape(16.dp)),
             contentAlignment = Alignment.Center
         ) {
-            AndroidView(
-                factory = { ctx ->
-                    VideoView(ctx).apply {
-                        val file = File(clip.filePath)
-                        if (file.exists()) {
-                            setVideoURI(Uri.fromFile(file))
-                        }
-                        setOnPreparedListener { mp ->
-                            mediaPlayerInstance = mp
-                            mp.isLooping = true
-                            try {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                    val params = PlaybackParams()
-                                    params.speed = speed
-                                    mp.playbackParams = params
-                                }
-                            } catch (e: Exception) {
-                                e.printStackTrace()
-                            }
-                            mp.start()
-                            isPlaying = true
-                        }
-                    }
-                },
-                update = { vv ->
-                    try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            mediaPlayerInstance?.let { mp ->
-                                val params = mp.playbackParams
-                                params.speed = speed
-                                mp.playbackParams = params
-                            }
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-
-            // Play / Pause Overlay Button
-            Box(
-                modifier = Modifier
-                    .size(54.dp)
-                    .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.5f))
-                    .clickable {
-                        mediaPlayerInstance?.let { mp ->
-                            if (mp.isPlaying) {
-                                mp.pause()
-                                isPlaying = false
+            if (!hasPlaybackError) {
+                AndroidView(
+                    factory = { ctx ->
+                        VideoView(ctx).apply {
+                            videoViewRef = this
+                            val videoUri = if (clip.filePath.startsWith("content://")) {
+                                Uri.parse(clip.filePath)
                             } else {
+                                val file = File(clip.filePath)
+                                if (file.exists()) Uri.fromFile(file) else null
+                            }
+                            if (videoUri != null) {
+                                setVideoURI(videoUri)
+                            } else {
+                                hasPlaybackError = true
+                            }
+                            setOnErrorListener { _, _, _ ->
+                                hasPlaybackError = true
+                                isPlaying = false
+                                true
+                            }
+                            setOnPreparedListener { mp ->
+                                mediaPlayerInstance = mp
+                                mp.isLooping = true
+                                try {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                        val params = PlaybackParams()
+                                        params.speed = speed
+                                        mp.playbackParams = params
+                                    }
+                                } catch (_: Exception) {
+                                }
                                 mp.start()
                                 isPlaying = true
                             }
                         }
                     },
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                    contentDescription = "Play/Pause",
-                    tint = CinemaAmber,
-                    modifier = Modifier.size(32.dp)
+                    modifier = Modifier.fillMaxSize()
                 )
+
+                // Play / Pause Overlay Button
+                Box(
+                    modifier = Modifier
+                        .size(54.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.5f))
+                        .clickable {
+                            mediaPlayerInstance?.let { mp ->
+                                try {
+                                    if (mp.isPlaying) {
+                                        mp.pause()
+                                        isPlaying = false
+                                    } else {
+                                        mp.start()
+                                        isPlaying = true
+                                    }
+                                } catch (_: Exception) {
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                        contentDescription = "Play/Pause",
+                        tint = CinemaAmber,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            } else {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(16.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.VideocamOff,
+                        contentDescription = null,
+                        tint = CinemaRed,
+                        modifier = Modifier.size(40.dp)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Unable to play this video clip",
+                        color = CinemaTextSecondary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
 
             // Current Speed Overlay Badge
@@ -427,6 +482,7 @@ fun ClipPlayerView(
                 Box(
                     modifier = Modifier
                         .weight(1f)
+                        .defaultMinSize(minHeight = 48.dp)
                         .clip(RoundedCornerShape(8.dp))
                         .background(if (isSelected) CinemaAmber else CinemaElevatedSurface)
                         .clickable { onSpeedChange(s) }

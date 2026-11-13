@@ -2,31 +2,39 @@ package com.example.camera
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.SystemClock
+import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Log
 import android.util.Range
+import android.view.TextureView
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
-import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.MediaStoreOutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
@@ -44,6 +52,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.TimeUnit
 import kotlin.math.atan2
 import kotlin.math.log10
 import kotlin.math.roundToInt
@@ -62,6 +71,9 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
     private var currentPreviewView: PreviewView? = null
     private var gyroProcessor: GyroStabilizerSurfaceProcessor? = null
     private val gyroFilter = GyroStabilizerFilter()
+
+    private var activeHardwareInfo: CameraHardwareInfo =
+        CameraHardwareHelper.queryCameraCapabilities(context, isFrontCamera = false)
 
     // Sensors for Level / Stabilizer
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
@@ -94,6 +106,16 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
     private val _shakeCancelledDegrees = MutableStateFlow(0f)
     val shakeCancelledDegrees: StateFlow<Float> = _shakeCancelledDegrees.asStateFlow()
 
+    // Zoom state
+    private val _zoomRatio = MutableStateFlow(1.0f)
+    val zoomRatio: StateFlow<Float> = _zoomRatio.asStateFlow()
+
+    private val _minZoomRatio = MutableStateFlow(1.0f)
+    val minZoomRatio: StateFlow<Float> = _minZoomRatio.asStateFlow()
+
+    private val _maxZoomRatio = MutableStateFlow(4.0f)
+    val maxZoomRatio: StateFlow<Float> = _maxZoomRatio.asStateFlow()
+
     // CameraX VideoCapture & Preview hardware-accelerated stabilization capability & active state
     private val _isHardwareStabilizationSupported = MutableStateFlow(true)
     val isHardwareStabilizationSupported: StateFlow<Boolean> = _isHardwareStabilizationSupported.asStateFlow()
@@ -106,6 +128,31 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
     private val _isGlStabilizerActive = MutableStateFlow(false)
     val isGlStabilizerActive: StateFlow<Boolean> = _isGlStabilizerActive.asStateFlow()
+
+    private val _isGlFilterActive = MutableStateFlow(false)
+    val isGlFilterActive: StateFlow<Boolean> = _isGlFilterActive.asStateFlow()
+
+    private val _hasFlashUnit = MutableStateFlow(true)
+    val hasFlashUnit: StateFlow<Boolean> = _hasFlashUnit.asStateFlow()
+
+    // Real-time viewfinder telemetry (24x14 zero-allocation grid from PreviewView TextureView)
+    private val _lumaHistogram = MutableStateFlow<List<Float>>(List(16) { 0f })
+    val lumaHistogram: StateFlow<List<Float>> = _lumaHistogram.asStateFlow()
+
+    private val _zebraCells = MutableStateFlow(BooleanArray(ANALYSIS_COLS * ANALYSIS_ROWS))
+    val zebraCells: StateFlow<BooleanArray> = _zebraCells.asStateFlow()
+
+    private val _focusPeakingCells = MutableStateFlow(BooleanArray(ANALYSIS_COLS * ANALYSIS_ROWS))
+    val focusPeakingCells: StateFlow<BooleanArray> = _focusPeakingCells.asStateFlow()
+
+    private var analysisBitmap: Bitmap? = null
+    private val analysisPixels = IntArray(ANALYSIS_COLS * ANALYSIS_ROWS)
+    private val analysisLuma = IntArray(ANALYSIS_COLS * ANALYSIS_ROWS)
+
+    companion object {
+        const val ANALYSIS_COLS = 24
+        const val ANALYSIS_ROWS = 14
+    }
 
     // Low-pass filter state for ultra-smooth gyro damping
     private var filteredRoll = 0f
@@ -126,10 +173,11 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
     private var recordingStartTime = 0L
     private var recordingJob: Job? = null
-    private var audioMeterJob: Job? = null
 
     private var currentRecordingFile: File? = null
+    private var currentRecordingTitle: String = ""
     private var onClipFinalizedCallback: ((VideoClip) -> Unit)? = null
+    private var onClipErrorCallback: ((String) -> Unit)? = null
 
     // Video config
     var fpsMode: FpsMode = FpsMode.FPS_120
@@ -207,6 +255,9 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             gyroProcessor?.release()
             gyroProcessor = null
             _isGlStabilizerActive.value = false
+            _isGlFilterActive.value = false
+
+            activeHardwareInfo = CameraHardwareHelper.queryCameraCapabilities(context, isFrontCamera)
 
             val cameraSelector = if (isFrontCamera) {
                 CameraSelector.DEFAULT_FRONT_CAMERA
@@ -231,29 +282,24 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                     previewStabSupported
             _isHardwareStabilizationActive.value = shouldEnableHwStabilization
 
-            // Build Preview with CameraX Preview Stabilization + Camera2Interop options
+            // Build Preview with CameraX Preview Stabilization + hardware-safe Camera2Interop options
             val previewBuilder = Preview.Builder()
             if (shouldEnablePreviewStabilization) {
                 previewBuilder.setPreviewStabilizationEnabled(true)
             }
             val camera2Config = Camera2Interop.Extender(previewBuilder)
 
-            val targetFps = fpsMode.fps
-            val minAeFps = if (
-                isAntiBlurShutterEnabled &&
-                gyroStabilizerStrength != GyroStabilizerStrength.OFF
-            ) {
-                when {
-                    targetFps >= 60 -> 60
-                    else -> 30
-                }
-            } else {
-                targetFps.coerceAtMost(60)
-            }
-            camera2Config.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                Range(minAeFps.coerceAtMost(targetFps), targetFps)
+            val bestFpsRange = CameraHardwareHelper.chooseBestFpsRange(
+                availableRanges = activeHardwareInfo.availableAeFpsRanges,
+                targetFps = fpsMode.fps,
+                preferFastShutterFloor = isAntiBlurShutterEnabled && gyroStabilizerStrength != GyroStabilizerStrength.OFF
             )
+            if (bestFpsRange != null) {
+                camera2Config.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    bestFpsRange
+                )
+            }
             camera2Config.setCaptureRequestOption(
                 CaptureRequest.CONTROL_CAPTURE_INTENT,
                 CameraMetadata.CONTROL_CAPTURE_INTENT_VIDEO_RECORD
@@ -302,9 +348,10 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
             videoCaptureUseCase = videoCaptureBuilder.build()
 
-            val shouldAttachGlEffect = allowGlEffect &&
-                stabilizationMode != StabilizationMode.OFF &&
+            val needsGyroWarp = stabilizationMode != StabilizationMode.OFF &&
                 gyroStabilizerStrength != GyroStabilizerStrength.OFF
+            val needsColorLut = currentColorFilter != ColorFilterType.NORMAL
+            val shouldAttachGlEffect = allowGlEffect && (needsGyroWarp || needsColorLut)
 
             if (shouldAttachGlEffect) {
                 val sensorOrient = selectedCameraInfo?.sensorRotationDegrees
@@ -316,9 +363,9 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                     filter = gyroFilter,
                     onShakeTelemetry = { deg -> _shakeCancelledDegrees.value = deg },
                     onFatalGlError = { err ->
-                        Log.w(TAG, "GL Gyro Stabilizer runtime error, falling back cleanly", err)
+                        Log.w(TAG, "GL Processor runtime error, falling back cleanly", err)
                         coroutineScope.launch {
-                            if (_isGlStabilizerActive.value && !_isRecording.value) {
+                            if ((_isGlStabilizerActive.value || _isGlFilterActive.value) && !_isRecording.value) {
                                 bindCameraUseCases(allowGlEffect = false)
                             }
                         }
@@ -326,6 +373,7 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 ).apply {
                     sensorOrientationDegrees = sensorOrient
                     isFrontCamera = this@CameraVideoEngine.isFrontCamera
+                    colorFilter = currentColorFilter
                 }
                 gyroProcessor = processor
 
@@ -348,12 +396,14 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                         cameraSelector,
                         useCaseGroup
                     )
-                    _isGlStabilizerActive.value = true
+                    _isGlStabilizerActive.value = needsGyroWarp
+                    _isGlFilterActive.value = true
                 } catch (glBindError: Exception) {
-                    Log.w(TAG, "UseCaseGroup GL Gyro CameraEffect unsupported on stream, binding direct", glBindError)
+                    Log.w(TAG, "UseCaseGroup GL CameraEffect unsupported on stream, binding direct", glBindError)
                     processor.release()
                     gyroProcessor = null
                     _isGlStabilizerActive.value = false
+                    _isGlFilterActive.value = false
                     camera = provider.bindToLifecycle(
                         lifecycleOwner,
                         cameraSelector,
@@ -370,16 +420,151 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 )
             }
 
-            camera?.cameraControl?.enableTorch(isFlashTorchOn)
+            syncCameraCapabilitiesFromBoundCamera()
 
             Log.d(
                 TAG,
-                "Camera bound | FPS: ${fpsMode.fps} | Mode: ${stabilizationMode.name} | GL Gyro EIS: ${_isGlStabilizerActive.value} (${gyroStabilizerStrength.shortBadge}) | HW Stab: $shouldEnableHwStabilization | Preview Stab: $shouldEnablePreviewStabilization"
+                "Camera bound | FPS: ${fpsMode.fps} ($bestFpsRange) | Mode: ${stabilizationMode.name} | GL Gyro EIS: ${_isGlStabilizerActive.value} (${gyroStabilizerStrength.shortBadge}) | GL LUT: ${_isGlFilterActive.value} | HW Stab: $shouldEnableHwStabilization"
             )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind Preview + VideoCapture, attempting Preview-only fallback", e)
             bindPreviewOnlyFallback(provider, lifecycleOwner, previewView)
         }
+    }
+
+    private fun syncCameraCapabilitiesFromBoundCamera() {
+        val cam = camera ?: return
+        val flashAvailable = cam.cameraInfo.hasFlashUnit()
+        _hasFlashUnit.value = flashAvailable
+        if (!flashAvailable) {
+            isFlashTorchOn = false
+        }
+        cam.cameraControl.enableTorch(isFlashTorchOn && flashAvailable)
+        val zState = cam.cameraInfo.zoomState.value
+        if (zState != null) {
+            _minZoomRatio.value = zState.minZoomRatio
+            _maxZoomRatio.value = zState.maxZoomRatio
+            val clamped = _zoomRatio.value.coerceIn(zState.minZoomRatio, zState.maxZoomRatio)
+            _zoomRatio.value = clamped
+            if (clamped != 1.0f) {
+                cam.cameraControl.setZoomRatio(clamped)
+            }
+        }
+    }
+
+    /**
+     * Zero-allocation 24x14 preview frame sampler that drives genuine live Histogram,
+     * Zebra overexposure clipping, and Focus Peaking contrast edges without consuming
+     * an extra CameraX ImageAnalysis hardware stream.
+     */
+    fun analyzePreviewFrame(
+        computeHistogram: Boolean,
+        computeZebra: Boolean,
+        computeFocusPeaking: Boolean
+    ) {
+        if (!computeHistogram && !computeZebra && !computeFocusPeaking) return
+        val previewView = currentPreviewView ?: return
+        if (!previewView.isAttachedToWindow || previewView.width <= 0 || previewView.height <= 0) return
+        val textureView = previewView.getChildAt(0) as? TextureView ?: return
+        if (!textureView.isAvailable) return
+
+        try {
+            val bmp = analysisBitmap ?: Bitmap.createBitmap(
+                ANALYSIS_COLS,
+                ANALYSIS_ROWS,
+                Bitmap.Config.ARGB_8888
+            ).also { analysisBitmap = it }
+
+            textureView.getBitmap(bmp)
+            bmp.getPixels(analysisPixels, 0, ANALYSIS_COLS, 0, 0, ANALYSIS_COLS, ANALYSIS_ROWS)
+
+            val bins = if (computeHistogram) IntArray(16) else null
+            val zebra = if (computeZebra) BooleanArray(ANALYSIS_COLS * ANALYSIS_ROWS) else null
+
+            for (i in analysisPixels.indices) {
+                val px = analysisPixels[i]
+                val r = (px shr 16) and 0xFF
+                val g = (px shr 8) and 0xFF
+                val b = px and 0xFF
+                // Rec.709 fast integer luminance 0..255
+                val luma = (54 * r + 183 * g + 19 * b) shr 8
+                analysisLuma[i] = luma
+                if (bins != null) {
+                    val bin = (luma * 15) / 255
+                    bins[bin]++
+                }
+                if (zebra != null) {
+                    zebra[i] = luma >= 225
+                }
+            }
+
+            if (bins != null) {
+                val maxBin = bins.maxOrNull()?.coerceAtLeast(1) ?: 1
+                _lumaHistogram.value = bins.map { it.toFloat() / maxBin.toFloat() }
+            }
+            if (zebra != null) {
+                _zebraCells.value = zebra
+            }
+            if (computeFocusPeaking) {
+                val peaking = BooleanArray(ANALYSIS_COLS * ANALYSIS_ROWS)
+                for (y in 1 until ANALYSIS_ROWS - 1) {
+                    for (x in 1 until ANALYSIS_COLS - 1) {
+                        val idx = y * ANALYSIS_COLS + x
+                        val c = analysisLuma[idx]
+                        val grad = kotlin.math.abs(analysisLuma[idx - 1] - c) +
+                            kotlin.math.abs(analysisLuma[idx + 1] - c) +
+                            kotlin.math.abs(analysisLuma[idx - ANALYSIS_COLS] - c) +
+                            kotlin.math.abs(analysisLuma[idx + ANALYSIS_COLS] - c)
+                        peaking[idx] = grad >= 85
+                    }
+                }
+                _focusPeakingCells.value = peaking
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    fun setLiveColorFilter(filter: ColorFilterType) {
+        val prev = currentColorFilter
+        currentColorFilter = filter
+        val processor = gyroProcessor
+        if (processor != null) {
+            processor.colorFilter = filter
+        } else if (filter != ColorFilterType.NORMAL && prev == ColorFilterType.NORMAL && !_isRecording.value) {
+            // Attach GL processor so LUT bakes into recorded video too
+            bindCameraUseCases()
+        }
+    }
+
+    fun tapToFocus(x: Float, y: Float) {
+        val cam = camera ?: return
+        val previewView = currentPreviewView ?: return
+        try {
+            val point = previewView.meteringPointFactory.createPoint(x, y)
+            val action = FocusMeteringAction.Builder(
+                point,
+                FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
+            )
+                .setAutoCancelDuration(3, TimeUnit.SECONDS)
+                .build()
+            cam.cameraControl.startFocusAndMetering(action)
+        } catch (e: Exception) {
+            Log.w(TAG, "Tap-to-focus failed", e)
+        }
+    }
+
+    fun setZoomRatio(ratio: Float) {
+        val cam = camera
+        val minZ = _minZoomRatio.value
+        val maxZ = _maxZoomRatio.value.coerceAtLeast(minZ)
+        val clamped = ratio.coerceIn(minZ, maxZ)
+        _zoomRatio.value = clamped
+        cam?.cameraControl?.setZoomRatio(clamped)
+    }
+
+    fun zoomBy(scaleFactor: Float) {
+        if (scaleFactor <= 0f) return
+        setZoomRatio(_zoomRatio.value * scaleFactor)
     }
 
     fun syncGyroFilterConfig(hwStabActive: Boolean = _isHardwareStabilizationActive.value) {
@@ -392,8 +577,6 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             (stabilizationMode == StabilizationMode.SUPER_EXTREME ||
                 gyroStabilizerStrength == GyroStabilizerStrength.ACTION ||
                 gyroStabilizerStrength == GyroStabilizerStrength.LOCKDOWN)
-        // If HAL EIS is also active, blend GL Gyro gain to 0.70x so it absorbs large shakes & horizon tilt without double-correcting small jitter.
-        // If HAL EIS is off/unsupported, engage full 1.05x GL Gyro lock.
         val hasHalEis = hwStabActive &&
             stabilizationMode != StabilizationMode.OIS &&
             stabilizationMode != StabilizationMode.OFF
@@ -410,6 +593,8 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             provider.unbindAll()
             videoCaptureUseCase = null
             _isHardwareStabilizationActive.value = false
+            _isGlStabilizerActive.value = false
+            _isGlFilterActive.value = false
 
             val cameraSelector = if (isFrontCamera) {
                 CameraSelector.DEFAULT_FRONT_CAMERA
@@ -421,7 +606,7 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 it.setSurfaceProvider(previewView.surfaceProvider)
             }
             camera = provider.bindToLifecycle(lifecycleOwner, cameraSelector, previewUseCase)
-            camera?.cameraControl?.enableTorch(isFlashTorchOn)
+            syncCameraCapabilitiesFromBoundCamera()
         } catch (e: Exception) {
             Log.e(TAG, "Preview-only fallback also failed", e)
         }
@@ -503,6 +688,39 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
         }
     }
 
+    private fun clampedIso(): Int =
+        manualIso.coerceIn(activeHardwareInfo.minIso, activeHardwareInfo.maxIso.coerceAtLeast(activeHardwareInfo.minIso))
+
+    private fun clampedExposureTimeNs(): Long {
+        val raw = shutterSpeeds.getOrNull(manualShutterSpeedIndex)?.second ?: (1_000_000_000L / 120)
+        return raw.coerceIn(
+            activeHardwareInfo.minExposureTimeNs,
+            activeHardwareInfo.maxExposureTimeNs.coerceAtLeast(activeHardwareInfo.minExposureTimeNs)
+        )
+    }
+
+    private fun clampedEvIndex(): Int {
+        val step = activeHardwareInfo.evStep.coerceAtLeast(0.05f)
+        return (manualEvCompensation / step).roundToInt()
+            .coerceIn(activeHardwareInfo.minEv, activeHardwareInfo.maxEv.coerceAtLeast(activeHardwareInfo.minEv))
+    }
+
+    private fun manualFocusDiopters(): Float {
+        val maxDiopters = activeHardwareInfo.maxFocusDistance.coerceAtLeast(0f)
+        // UI slider: 0.0 = Near (Macro -> maxDiopters), 1.0 = Infinity (0.0 diopters)
+        return ((1f - manualFocusDistance.coerceIn(0f, 1f)) * maxDiopters).coerceIn(0f, maxDiopters)
+    }
+
+    private fun camera2AwbMode(): Int = when (whiteBalanceMode) {
+        WhiteBalanceMode.AUTO -> CameraMetadata.CONTROL_AWB_MODE_AUTO
+        WhiteBalanceMode.DAYLIGHT -> CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT
+        WhiteBalanceMode.CLOUDY -> CameraMetadata.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT
+        WhiteBalanceMode.SHADE -> CameraMetadata.CONTROL_AWB_MODE_SHADE
+        WhiteBalanceMode.TUNGSTEN -> CameraMetadata.CONTROL_AWB_MODE_INCANDESCENT
+        WhiteBalanceMode.FLUORESCENT -> CameraMetadata.CONTROL_AWB_MODE_FLUORESCENT
+        WhiteBalanceMode.CUSTOM -> CameraMetadata.CONTROL_AWB_MODE_WARM_FLUORESCENT
+    }
+
     @OptIn(ExperimentalCamera2Interop::class)
     private fun applyExposureToInterop(extender: Camera2Interop.Extender<*>) {
         if (exposureMode == ExposureMode.MANUAL) {
@@ -512,30 +730,25 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             )
             extender.setCaptureRequestOption(
                 CaptureRequest.SENSOR_SENSITIVITY,
-                manualIso
+                clampedIso()
             )
-            val expTime = shutterSpeeds.getOrNull(manualShutterSpeedIndex)?.second
-                ?: (1_000_000_000L / 120)
             extender.setCaptureRequestOption(
                 CaptureRequest.SENSOR_EXPOSURE_TIME,
-                expTime
+                clampedExposureTimeNs()
             )
         } else {
             extender.setCaptureRequestOption(
                 CaptureRequest.CONTROL_AE_MODE,
                 CameraMetadata.CONTROL_AE_MODE_ON
             )
-            val evIndex = (manualEvCompensation * 3).roundToInt()
             extender.setCaptureRequestOption(
                 CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
-                evIndex
+                clampedEvIndex()
             )
-            if (isAeLocked) {
-                extender.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AE_LOCK,
-                    true
-                )
-            }
+            extender.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AE_LOCK,
+                isAeLocked
+            )
         }
     }
 
@@ -555,7 +768,7 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 )
                 extender.setCaptureRequestOption(
                     CaptureRequest.LENS_FOCUS_DISTANCE,
-                    manualFocusDistance * 10f
+                    manualFocusDiopters()
                 )
             }
             FocusMode.MACRO -> {
@@ -579,38 +792,10 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
     @OptIn(ExperimentalCamera2Interop::class)
     private fun applyWhiteBalanceToInterop(extender: Camera2Interop.Extender<*>) {
-        when (whiteBalanceMode) {
-            WhiteBalanceMode.AUTO -> extender.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AWB_MODE,
-                CameraMetadata.CONTROL_AWB_MODE_AUTO
-            )
-            WhiteBalanceMode.DAYLIGHT -> extender.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AWB_MODE,
-                CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT
-            )
-            WhiteBalanceMode.CLOUDY -> extender.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AWB_MODE,
-                CameraMetadata.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT
-            )
-            WhiteBalanceMode.SHADE -> extender.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AWB_MODE,
-                CameraMetadata.CONTROL_AWB_MODE_SHADE
-            )
-            WhiteBalanceMode.TUNGSTEN -> extender.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AWB_MODE,
-                CameraMetadata.CONTROL_AWB_MODE_INCANDESCENT
-            )
-            WhiteBalanceMode.FLUORESCENT -> extender.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AWB_MODE,
-                CameraMetadata.CONTROL_AWB_MODE_FLUORESCENT
-            )
-            WhiteBalanceMode.CUSTOM -> {
-                extender.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AWB_MODE,
-                    CameraMetadata.CONTROL_AWB_MODE_AUTO
-                )
-            }
-        }
+        extender.setCaptureRequestOption(
+            CaptureRequest.CONTROL_AWB_MODE,
+            camera2AwbMode()
+        )
     }
 
     @OptIn(ExperimentalCamera2Interop::class)
@@ -627,23 +812,20 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 )
                 optionsBuilder.setCaptureRequestOption(
                     CaptureRequest.SENSOR_SENSITIVITY,
-                    manualIso
+                    clampedIso()
                 )
-                val expTime = shutterSpeeds.getOrNull(manualShutterSpeedIndex)?.second
-                    ?: (1_000_000_000L / 120)
                 optionsBuilder.setCaptureRequestOption(
                     CaptureRequest.SENSOR_EXPOSURE_TIME,
-                    expTime
+                    clampedExposureTimeNs()
                 )
             } else {
                 optionsBuilder.setCaptureRequestOption(
                     CaptureRequest.CONTROL_AE_MODE,
                     CameraMetadata.CONTROL_AE_MODE_ON
                 )
-                val evIndex = (manualEvCompensation * 3).roundToInt()
                 optionsBuilder.setCaptureRequestOption(
                     CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
-                    evIndex
+                    clampedEvIndex()
                 )
                 optionsBuilder.setCaptureRequestOption(
                     CaptureRequest.CONTROL_AE_LOCK,
@@ -705,21 +887,46 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             }
 
             // Focus
-            if (focusMode == FocusMode.MANUAL) {
-                optionsBuilder.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AF_MODE,
-                    CameraMetadata.CONTROL_AF_MODE_OFF
-                )
-                optionsBuilder.setCaptureRequestOption(
-                    CaptureRequest.LENS_FOCUS_DISTANCE,
-                    manualFocusDistance * 10f
-                )
-            } else if (focusMode == FocusMode.CONTINUOUS) {
-                optionsBuilder.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_AF_MODE,
-                    CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO
-                )
+            when (focusMode) {
+                FocusMode.MANUAL -> {
+                    optionsBuilder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CameraMetadata.CONTROL_AF_MODE_OFF
+                    )
+                    optionsBuilder.setCaptureRequestOption(
+                        CaptureRequest.LENS_FOCUS_DISTANCE,
+                        manualFocusDiopters()
+                    )
+                }
+                FocusMode.CONTINUOUS -> {
+                    optionsBuilder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                    )
+                }
+                FocusMode.MACRO -> {
+                    optionsBuilder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CameraMetadata.CONTROL_AF_MODE_MACRO
+                    )
+                }
+                FocusMode.INFINITY -> {
+                    optionsBuilder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CameraMetadata.CONTROL_AF_MODE_OFF
+                    )
+                    optionsBuilder.setCaptureRequestOption(
+                        CaptureRequest.LENS_FOCUS_DISTANCE,
+                        0.0f
+                    )
+                }
             }
+
+            // White Balance live update without restarting session
+            optionsBuilder.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AWB_MODE,
+                camera2AwbMode()
+            )
 
             camera2Control.setCaptureRequestOptions(optionsBuilder.build())
             cam.cameraControl.enableTorch(isFlashTorchOn)
@@ -729,64 +936,107 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
     }
 
     /**
-     * Start video recording using CameraX VideoCapture when available, with robust fallback
+     * Start video recording into device MediaStore Movies/CineFlowPro (API 29+) or app Movies directory (API 24-28).
      */
     @SuppressLint("MissingPermission")
     fun startRecording(
-        onSuccess: (File) -> Unit,
+        onSuccess: (String) -> Unit,
         onError: (String) -> Unit,
         onClipFinalized: (VideoClip) -> Unit = {}
     ) {
         if (_isRecording.value) return
 
+        val videoCapture = videoCaptureUseCase
+        if (videoCapture == null) {
+            onError("Camera video recorder unavailable on this device")
+            return
+        }
+
         try {
-            val outputDir = File(context.filesDir, "CineFlowVideos").apply { if (!exists()) mkdirs() }
             val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val prefix = if (fpsMode.isHighSpeed) "SLOWMO_${fpsMode.fps}FPS_" else "CINE_${fpsMode.fps}FPS_"
-            val videoFile = File(outputDir, "${prefix}${timeStamp}.mp4")
-            currentRecordingFile = videoFile
+            val displayName = "${prefix}${timeStamp}"
+            currentRecordingTitle = displayName
             onClipFinalizedCallback = onClipFinalized
+            onClipErrorCallback = onError
 
-            val videoCapture = videoCaptureUseCase
-            if (videoCapture != null) {
-                val outputOptions = FileOutputOptions.Builder(videoFile).build()
-                var pendingRecording = videoCapture.output.prepareRecording(context, outputOptions)
-
-                val hasAudioPerm = ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.RECORD_AUDIO
-                ) == PackageManager.PERMISSION_GRANTED
-                if (hasAudioPerm) {
-                    pendingRecording = pendingRecording.withAudioEnabled()
+            var pendingRecording = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                currentRecordingFile = null
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, "$displayName.mp4")
+                    put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/CineFlowPro")
                 }
+                val mediaStoreOutput = MediaStoreOutputOptions.Builder(
+                    context.contentResolver,
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                ).setContentValues(contentValues).build()
+                videoCapture.output.prepareRecording(context, mediaStoreOutput)
+            } else {
+                val outputDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+                    ?.let { File(it, "CineFlowPro") }
+                    ?: File(context.filesDir, "CineFlowVideos")
+                if (!outputDir.exists()) outputDir.mkdirs()
+                val videoFile = File(outputDir, "$displayName.mp4")
+                currentRecordingFile = videoFile
+                val fileOutput = FileOutputOptions.Builder(videoFile).build()
+                videoCapture.output.prepareRecording(context, fileOutput)
+            }
 
-                activeRecording = pendingRecording.start(ContextCompat.getMainExecutor(context)) { event ->
-                    when (event) {
-                        is VideoRecordEvent.Start -> {
-                            Log.d(TAG, "CameraX VideoCapture recording started (HW stab=${_isHardwareStabilizationActive.value})")
-                        }
-                        is VideoRecordEvent.Status -> {
-                            val audioStats = event.recordingStats.audioStats
-                            if (audioStats.hasAudio()) {
-                                val amp = audioStats.audioAmplitude.coerceAtLeast(0.0001)
-                                _audioDb.value = (20.0 * log10(amp)).toFloat().coerceIn(-60f, 0f)
-                            }
-                        }
-                        is VideoRecordEvent.Finalize -> {
-                            if (event.hasError()) {
-                                Log.w(TAG, "VideoCapture finalized with error code ${event.error}, ensuring file exists")
-                            }
-                            activeRecording = null
-                            val clip = buildVideoClipMetadata(videoFile, recordingElapsedSnapshot)
-                            onClipFinalizedCallback?.invoke(clip)
-                            onClipFinalizedCallback = null
+            val hasAudioPerm = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (hasAudioPerm) {
+                pendingRecording = pendingRecording.withAudioEnabled()
+            }
+
+            activeRecording = pendingRecording.start(ContextCompat.getMainExecutor(context)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        Log.d(TAG, "CameraX VideoCapture started (GL=${_isGlStabilizerActive.value}, HW=${_isHardwareStabilizationActive.value})")
+                    }
+                    is VideoRecordEvent.Status -> {
+                        val audioStats = event.recordingStats.audioStats
+                        if (audioStats.hasAudio()) {
+                            val amp = audioStats.audioAmplitude.coerceAtLeast(0.0001)
+                            _audioDb.value = (20.0 * log10(amp)).toFloat().coerceIn(-60f, 0f)
                         }
                     }
+                    is VideoRecordEvent.Finalize -> {
+                        activeRecording = null
+                        _isRecording.value = false
+                        recordingJob?.cancel()
+                        _audioDb.value = -60f
+
+                        val uri = event.outputResults.outputUri
+                        val nonFatalLimitError = event.error == VideoRecordEvent.Finalize.ERROR_DURATION_LIMIT_REACHED ||
+                            event.error == VideoRecordEvent.Finalize.ERROR_FILE_SIZE_LIMIT_REACHED
+
+                        if (event.hasError() && !nonFatalLimitError) {
+                            Log.e(TAG, "VideoCapture failed with error=${event.error}", event.cause)
+                            if (uri != Uri.EMPTY) {
+                                try {
+                                    context.contentResolver.delete(uri, null, null)
+                                } catch (_: Exception) {
+                                }
+                            }
+                            currentRecordingFile?.let { f ->
+                                if (f.exists() && f.length() == 0L) f.delete()
+                            }
+                            onClipErrorCallback?.invoke("Recording failed (code ${event.error})")
+                        } else {
+                            val clip = buildVideoClipMetadata(uri, currentRecordingFile, currentRecordingTitle, recordingElapsedSnapshot)
+                            if (clip != null) {
+                                onClipFinalizedCallback?.invoke(clip)
+                            } else {
+                                onClipErrorCallback?.invoke("Recorded video file was empty")
+                            }
+                        }
+                        onClipFinalizedCallback = null
+                        onClipErrorCallback = null
+                    }
                 }
-            } else {
-                activeRecording = null
-                videoFile.writeBytes(ByteArray(1024 * 64))
-                startFallbackAudioMeter()
             }
 
             _isRecording.value = true
@@ -803,7 +1053,7 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 }
             }
 
-            onSuccess(videoFile)
+            onSuccess(displayName)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start recording", e)
             _isRecording.value = false
@@ -813,29 +1063,11 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
     private var recordingElapsedSnapshot: Long = 1L
 
-    private fun startFallbackAudioMeter() {
-        audioMeterJob?.cancel()
-        audioMeterJob = coroutineScope.launch {
-            val random = Random()
-            while (_isRecording.value) {
-                val base = -24f
-                val variance = (Math.sin(System.currentTimeMillis() / 200.0) * 12.0).toFloat()
-                _audioDb.value = (base + variance + (random.nextFloat() * 6f - 3f)).coerceIn(-50f, -2f)
-                delay(100)
-            }
-        }
-    }
-
-    /**
-     * Stop video recording. If CameraX Recording is active, returns null and delivers clip via onClipFinalized.
-     * Otherwise (fallback), finalizes synchronously and returns the VideoClip.
-     */
-    fun stopRecording(): VideoClip? {
-        if (!_isRecording.value) return null
+    fun stopRecording() {
+        if (!_isRecording.value) return
 
         _isRecording.value = false
         recordingJob?.cancel()
-        audioMeterJob?.cancel()
         _audioDb.value = -60f
 
         val elapsedSeconds = _recordingDurationSeconds.value.coerceAtLeast(1L)
@@ -849,33 +1081,30 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             } catch (e: Exception) {
                 Log.w(TAG, "Exception stopping CameraX Recording", e)
                 activeRecording = null
-                val file = currentRecordingFile ?: return null
-                return buildVideoClipMetadata(file, elapsedSeconds)
             }
-            return null
         }
-
-        val file = currentRecordingFile ?: return null
-        return buildVideoClipMetadata(file, elapsedSeconds)
     }
 
-    private fun buildVideoClipMetadata(file: File, elapsedSeconds: Long): VideoClip {
-        if (!file.exists() || file.length() == 0L) {
-            try {
-                file.writeBytes(
-                    ByteArray(
-                        (elapsedSeconds * (if (fpsMode.isHighSpeed) 800_000 else 400_000))
-                            .toInt()
-                            .coerceIn(1024 * 128, 50 * 1024 * 1024)
-                    )
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "Error finalizing file", e)
+    private fun buildVideoClipMetadata(
+        outputUri: Uri,
+        fallbackFile: File?,
+        title: String,
+        elapsedSeconds: Long
+    ): VideoClip? {
+        val (pathOrUri, byteSize) = if (outputUri != Uri.EMPTY && outputUri.scheme == "content") {
+            val size = queryUriSizeBytes(outputUri)
+            if (size <= 0L) return null
+            outputUri.toString() to size
+        } else {
+            val file = fallbackFile ?: outputUri.path?.let { File(it) }
+            if (file == null || !file.exists() || file.length() <= 0L) {
+                return null
             }
+            file.absolutePath to file.length()
         }
 
         val shutterText = shutterSpeeds.getOrNull(manualShutterSpeedIndex)?.first ?: "Auto"
-        val sizeFormatted = formatFileSize(file.length())
+        val sizeFormatted = formatFileSize(byteSize)
         val stabLabel = buildString {
             append(stabilizationMode.label)
             if (_isGlStabilizerActive.value && gyroStabilizerStrength != GyroStabilizerStrength.OFF) {
@@ -888,19 +1117,33 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
         return VideoClip(
             id = UUID.randomUUID().toString(),
-            filePath = file.absolutePath,
-            title = file.nameWithoutExtension,
+            filePath = pathOrUri,
+            title = title.ifBlank { "CineFlow_${System.currentTimeMillis()}" },
             timestamp = System.currentTimeMillis(),
             durationSeconds = elapsedSeconds,
             fps = fpsMode.fps,
             resolution = resolutionMode.shortName,
             filterName = currentColorFilter.displayName,
             stabilization = stabLabel,
-            iso = if (exposureMode == ExposureMode.MANUAL) manualIso else 200,
-            shutterSpeedText = if (exposureMode == ExposureMode.MANUAL) shutterText else "1/60s (Auto)",
+            iso = if (exposureMode == ExposureMode.MANUAL) clampedIso() else 200,
+            shutterSpeedText = if (exposureMode == ExposureMode.MANUAL) shutterText else "Auto",
             isSlowMotion = fpsMode.isHighSpeed,
             fileSizeFormatted = sizeFormatted
         )
+    }
+
+    private fun queryUriSizeBytes(uri: Uri): Long {
+        return try {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (idx >= 0 && !cursor.isNull(idx)) return cursor.getLong(idx)
+                }
+            }
+            context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
     }
 
     private fun formatFileSize(bytes: Long): String {
@@ -921,10 +1164,8 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             val rawPitch = Math.toDegrees(orientation[1].toDouble()).toFloat()
             val rawRoll = -Math.toDegrees(orientation[2].toDouble()).toFloat()
 
-            // Feed true gravity roll into the real-time GL gyro horizon lock filter
             gyroFilter.onRotationRollSample(rawRoll)
 
-            // Complementary low-pass smoothing for UI telemetry & fallback horizon lock
             val alpha = if (stabilizationMode == StabilizationMode.SUPER_EXTREME) 0.14f else 0.25f
             filteredPitch = filteredPitch * (1f - alpha) + rawPitch * alpha
             filteredRoll = filteredRoll * (1f - alpha) + rawRoll * alpha
@@ -953,14 +1194,12 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             _stabilizerDamping.value = eff
             _stabilityScore.value = (eff * 100).roundToInt()
         } else if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
-            val gx = event.values[0] // pitch velocity rad/s
-            val gy = event.values[1] // yaw velocity rad/s
-            val gz = event.values[2] // roll velocity rad/s
+            val gx = event.values[0]
+            val gy = event.values[1]
+            val gz = event.values[2]
 
-            // Feed exact nanosecond gyro velocity straight into the GL Recorded EIS integrator
             gyroFilter.onGyroSample(gx, gy, gz, event.timestamp)
 
-            // High-pass / decaying micro-jitter compensation for fallback UI preview
             gyroVelX = gyroVelX * 0.72f + gy * 0.28f
             gyroVelY = gyroVelY * 0.72f + gx * 0.28f
 
@@ -995,6 +1234,8 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
         coroutineScope.cancel()
         gyroProcessor?.release()
         gyroProcessor = null
+        analysisBitmap?.recycle()
+        analysisBitmap = null
         try {
             activeRecording?.stop()
         } catch (_: Exception) {

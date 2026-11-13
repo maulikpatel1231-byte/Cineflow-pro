@@ -20,6 +20,7 @@ import androidx.camera.core.SurfaceOutput
 import androidx.camera.core.SurfaceProcessor
 import androidx.camera.core.SurfaceRequest
 import androidx.core.util.Consumer
+import com.example.model.ColorFilterType
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -38,8 +39,9 @@ class GyroStabilizerEffect(
 )
 
 /**
- * Real-time OpenGL ES 2.0 CameraX SurfaceProcessor that stabilizes BOTH the live Preview
- * and the recorded VideoCapture MP4 frames using high-frequency 3-axis gyroscope data.
+ * Real-time OpenGL ES 2.0 CameraX SurfaceProcessor that stabilizes AND color-grades BOTH
+ * the live Preview and the recorded VideoCapture MP4 frames using 3-axis gyroscope data
+ * and active cinema LUT matrices.
  */
 class GyroStabilizerSurfaceProcessor(
     private val filter: GyroStabilizerFilter,
@@ -68,8 +70,12 @@ class GyroStabilizerSurfaceProcessor(
             precision mediump float;
             varying vec2 vTexCoord;
             uniform samplerExternalOES sTexture;
+            uniform mat3 uColorMatrix;
+            uniform vec3 uColorOffset;
             void main() {
-                gl_FragColor = texture2D(sTexture, vTexCoord);
+                vec4 texColor = texture2D(sTexture, vTexCoord);
+                vec3 graded = clamp(uColorMatrix * texColor.rgb + uColorOffset, 0.0, 1.0);
+                gl_FragColor = vec4(graded, texColor.a);
             }
         """
 
@@ -110,6 +116,9 @@ class GyroStabilizerSurfaceProcessor(
     @Volatile
     var isFrontCamera: Boolean = false
 
+    @Volatile
+    var colorFilter: ColorFilterType = ColorFilterType.NORMAL
+
     private val released = AtomicBoolean(false)
     private var glInitialized = false
 
@@ -123,8 +132,13 @@ class GyroStabilizerSurfaceProcessor(
     private var aTexCoordLoc = -1
     private var uMvpMatrixLoc = -1
     private var uTexMatrixLoc = -1
+    private var uColorMatrixLoc = -1
+    private var uColorOffsetLoc = -1
     private var sTextureLoc = -1
     private var oesTextureId = 0
+
+    private val colorMat3 = FloatArray(9)
+    private val colorOffset3 = FloatArray(3)
 
     private val vertexBuffer: FloatBuffer = ByteBuffer
         .allocateDirect(QUAD_COORDS.size * 4)
@@ -229,6 +243,15 @@ class GyroStabilizerSurfaceProcessor(
             surfaceTexture.getTransformMatrix(rawTexMatrix)
             val timestampNs = surfaceTexture.timestamp
 
+            val m = colorFilter.getColorMatrix().values
+            // Convert row-major 4x5 Compose ColorMatrix into column-major mat3 + normalized vec3 offset
+            colorMat3[0] = m[0]; colorMat3[1] = m[5]; colorMat3[2] = m[10]
+            colorMat3[3] = m[1]; colorMat3[4] = m[6]; colorMat3[5] = m[11]
+            colorMat3[6] = m[2]; colorMat3[7] = m[7]; colorMat3[8] = m[12]
+            colorOffset3[0] = m[4] / 255f
+            colorOffset3[1] = m[9] / 255f
+            colorOffset3[2] = m[14] / 255f
+
             var latestShakeDeg = 0f
             for ((surfaceOutput, target) in outputTargets) {
                 if (!target.surface.isValid) continue
@@ -262,6 +285,8 @@ class GyroStabilizerSurfaceProcessor(
 
                 GLES20.glUniformMatrix4fv(uMvpMatrixLoc, 1, false, mvpMatrix, 0)
                 GLES20.glUniformMatrix4fv(uTexMatrixLoc, 1, false, outputTexMatrix, 0)
+                GLES20.glUniformMatrix3fv(uColorMatrixLoc, 1, false, colorMat3, 0)
+                GLES20.glUniform3fv(uColorOffsetLoc, 1, colorOffset3, 0)
 
                 GLES20.glEnableVertexAttribArray(aPositionLoc)
                 GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer)
@@ -392,6 +417,8 @@ class GyroStabilizerSurfaceProcessor(
         aTexCoordLoc = GLES20.glGetAttribLocation(programId, "aTexCoord")
         uMvpMatrixLoc = GLES20.glGetUniformLocation(programId, "uMvpMatrix")
         uTexMatrixLoc = GLES20.glGetUniformLocation(programId, "uTexMatrix")
+        uColorMatrixLoc = GLES20.glGetUniformLocation(programId, "uColorMatrix")
+        uColorOffsetLoc = GLES20.glGetUniformLocation(programId, "uColorOffset")
         sTextureLoc = GLES20.glGetUniformLocation(programId, "sTexture")
 
         val texIds = IntArray(1)

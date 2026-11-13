@@ -107,10 +107,13 @@ private fun VerticalMeterBar(level: Float, label: String) {
 }
 
 @Composable
-fun HistogramOverlay(modifier: Modifier = Modifier) {
+fun HistogramOverlay(
+    lumaBins: List<Float> = emptyList(),
+    modifier: Modifier = Modifier
+) {
     Box(
         modifier = modifier
-            .size(width = 86.dp, height = 48.dp)
+            .size(width = 92.dp, height = 50.dp)
             .clip(RoundedCornerShape(6.dp))
             .background(CinemaDarkSurface.copy(alpha = 0.82f))
             .border(1.dp, CinemaBorder, RoundedCornerShape(6.dp))
@@ -119,38 +122,35 @@ fun HistogramOverlay(modifier: Modifier = Modifier) {
         Canvas(modifier = Modifier.fillMaxSize()) {
             val w = size.width
             val h = size.height
-            val points = 32
+            val bins = if (lumaBins.isNotEmpty()) lumaBins else List(16) { 0.08f }
+            val barCount = bins.size
+            val barW = w / barCount.toFloat()
 
-            // Draw RGB / Luma simulated curves for live exposure histogram
-            val lumaPath = androidx.compose.ui.graphics.Path()
-            lumaPath.moveTo(0f, h)
-
-            for (i in 0..points) {
-                val x = (i.toFloat() / points) * w
-                // Curve with realistic mid-tone bell curve
-                val normX = (i.toFloat() - points / 2f) / (points / 3.5f)
-                val curve = Math.exp(-0.5 * normX * normX).toFloat()
-                val y = h - (curve * (h * 0.85f))
-                if (i == 0) lumaPath.moveTo(x, y) else lumaPath.lineTo(x, y)
+            for (i in 0 until barCount) {
+                val mag = bins[i].coerceIn(0.03f, 1.0f)
+                val barH = mag * (h * 0.82f)
+                val barColor = when {
+                    i >= barCount - 2 -> CinemaRed.copy(alpha = 0.85f)
+                    i <= 1 -> CinemaAmber.copy(alpha = 0.7f)
+                    else -> CinemaCyan.copy(alpha = 0.65f)
+                }
+                drawRect(
+                    color = barColor,
+                    topLeft = Offset(i * barW + 0.5f, h - barH),
+                    size = Size((barW - 1f).coerceAtLeast(1f), barH)
+                )
             }
-            lumaPath.lineTo(w, h)
-            lumaPath.close()
 
-            drawPath(
-                path = lumaPath,
-                color = CinemaCyan.copy(alpha = 0.45f)
-            )
-
-            // Overexposure clipping alert line
+            // Overexposure clipping threshold marker
             drawLine(
-                color = CinemaRed.copy(alpha = 0.8f),
+                color = CinemaRed.copy(alpha = 0.75f),
                 start = Offset(w - 2f, 0f),
                 end = Offset(w - 2f, h),
-                strokeWidth = 1.5.dp.toPx()
+                strokeWidth = 1.dp.toPx()
             )
         }
         Text(
-            text = "HISTO",
+            text = "LUMA",
             color = CinemaTextMuted,
             fontSize = 7.sp,
             modifier = Modifier.align(Alignment.TopStart)

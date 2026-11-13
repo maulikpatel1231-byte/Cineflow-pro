@@ -45,9 +45,16 @@ fun ManualExposurePanel(
     val wbMode by viewModel.whiteBalanceMode.collectAsState()
     val isAeLocked by viewModel.isAeLocked.collectAsState()
     val fpsMode by viewModel.fpsMode.collectAsState()
+    val hwInfo by viewModel.hardwareInfo.collectAsState()
 
-    val isoPresets = listOf(50, 100, 200, 400, 800, 1600, 3200, 6400)
+    val baseIsoPresets = listOf(50, 100, 200, 400, 800, 1600, 3200, 6400)
+    val isoPresets = remember(hwInfo.minIso, hwInfo.maxIso) {
+        val inRange = baseIsoPresets.filter { it in hwInfo.minIso..hwInfo.maxIso }
+        (listOf(hwInfo.minIso) + inRange + listOf(hwInfo.maxIso)).distinct().sorted()
+    }
     val shutterOptions = viewModel.engine.shutterSpeeds
+    val minEvFloat = remember(hwInfo) { (hwInfo.minEv * hwInfo.evStep).coerceAtMost(-0.5f) }
+    val maxEvFloat = remember(hwInfo) { (hwInfo.maxEv * hwInfo.evStep).coerceAtLeast(0.5f) }
 
     // Calculate ideal 180-degree cinema shutter speed for currently selected FPS
     val idealShutterSpeed = "1/${fpsMode.fps * 2}s"
@@ -139,10 +146,11 @@ fun ManualExposurePanel(
                         val isSelected = manualIso == iso
                         Box(
                             modifier = Modifier
+                                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(if (isSelected) CinemaAmber else CinemaElevatedSurface)
                                 .clickable { viewModel.setManualIso(iso) }
-                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
@@ -186,28 +194,37 @@ fun ManualExposurePanel(
                 ) {
                     items(shutterOptions.indices.toList()) { idx ->
                         val option = shutterOptions[idx]
+                        val supported = option.second in hwInfo.minExposureTimeNs..hwInfo.maxExposureTimeNs
                         val isSelected = shutterIndex == idx
                         val isIdeal = option.first == idealShutterSpeed
                         Box(
                             modifier = Modifier
+                                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(
-                                    if (isSelected) CinemaCyan
-                                    else if (isIdeal) CinemaElevatedSurface.copy(alpha = 0.9f)
-                                    else CinemaElevatedSurface
+                                    when {
+                                        isSelected -> CinemaCyan
+                                        !supported -> CinemaElevatedSurface.copy(alpha = 0.45f)
+                                        isIdeal -> CinemaElevatedSurface.copy(alpha = 0.9f)
+                                        else -> CinemaElevatedSurface
+                                    }
                                 )
                                 .border(
-                                    width = if (isIdeal && !isSelected) 1.dp else 0.dp,
-                                    color = if (isIdeal && !isSelected) CinemaCyan else Color.Transparent,
+                                    width = if (isIdeal && !isSelected && supported) 1.dp else 0.dp,
+                                    color = if (isIdeal && !isSelected && supported) CinemaCyan else Color.Transparent,
                                     shape = RoundedCornerShape(8.dp)
                                 )
-                                .clickable { viewModel.setShutterIndex(idx) }
-                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                                .clickable(enabled = supported) { viewModel.setShutterIndex(idx) }
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
                                 text = option.first,
-                                color = if (isSelected) CinemaBlack else CinemaTextPrimary,
+                                color = when {
+                                    isSelected -> CinemaBlack
+                                    !supported -> CinemaTextMuted
+                                    else -> CinemaTextPrimary
+                                },
                                 fontSize = 11.sp,
                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                             )
@@ -230,10 +247,9 @@ fun ManualExposurePanel(
                     )
                 }
                 Slider(
-                    value = manualEv,
+                    value = manualEv.coerceIn(minEvFloat, maxEvFloat),
                     onValueChange = { viewModel.setManualEv(it) },
-                    valueRange = -3.0f..3.0f,
-                    steps = 19,
+                    valueRange = minEvFloat..maxEvFloat,
                     colors = SliderDefaults.colors(
                         thumbColor = CinemaAmber,
                         activeTrackColor = CinemaAmber,
@@ -246,6 +262,7 @@ fun ManualExposurePanel(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .defaultMinSize(minHeight = 48.dp)
                         .clip(RoundedCornerShape(8.dp))
                         .background(if (isAeLocked) CinemaAmber.copy(alpha = 0.2f) else CinemaElevatedSurface)
                         .clickable { viewModel.toggleAeLock() }
@@ -290,6 +307,7 @@ fun ManualExposurePanel(
                     Box(
                         modifier = Modifier
                             .weight(1f)
+                            .defaultMinSize(minHeight = 48.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .background(if (isSelected) CinemaCyan else CinemaElevatedSurface)
                             .clickable { viewModel.setFocusMode(mode) }
@@ -308,24 +326,32 @@ fun ManualExposurePanel(
 
             if (focusMode == FocusMode.MANUAL) {
                 Spacer(modifier = Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(text = "Near (Macro)", color = CinemaTextMuted, fontSize = 10.sp)
-                    Text(text = "MF Distance", color = CinemaCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                    Text(text = "Infinity (∞)", color = CinemaTextMuted, fontSize = 10.sp)
-                }
-                Slider(
-                    value = manualFocusDistance,
-                    onValueChange = { viewModel.setManualFocusDistance(it) },
-                    valueRange = 0.0f..1.0f,
-                    colors = SliderDefaults.colors(
-                        thumbColor = CinemaCyan,
-                        activeTrackColor = CinemaCyan,
-                        inactiveTrackColor = CinemaElevatedSurface
+                if (hwInfo.maxFocusDistance <= 0f) {
+                    Text(
+                        text = "Fixed-focus lens detected on this camera (manual diopter slider unavailable)",
+                        color = CinemaTextMuted,
+                        fontSize = 11.sp
                     )
-                )
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(text = "Near (Macro)", color = CinemaTextMuted, fontSize = 10.sp)
+                        Text(text = "MF Distance", color = CinemaCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(text = "Infinity (∞)", color = CinemaTextMuted, fontSize = 10.sp)
+                    }
+                    Slider(
+                        value = manualFocusDistance,
+                        onValueChange = { viewModel.setManualFocusDistance(it) },
+                        valueRange = 0.0f..1.0f,
+                        colors = SliderDefaults.colors(
+                            thumbColor = CinemaCyan,
+                            activeTrackColor = CinemaCyan,
+                            inactiveTrackColor = CinemaElevatedSurface
+                        )
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(18.dp))
@@ -341,10 +367,11 @@ fun ManualExposurePanel(
                     val isSelected = wbMode == wb
                     Box(
                         modifier = Modifier
+                            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .background(if (isSelected) CinemaAmber else CinemaElevatedSurface)
                             .clickable { viewModel.setWhiteBalance(wb) }
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
@@ -369,6 +396,7 @@ private fun RowScope.ModeTabButton(
     Box(
         modifier = Modifier
             .weight(1f)
+            .defaultMinSize(minHeight = 48.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(if (isSelected) CinemaAmber else Color.Transparent)
             .clickable(onClick = onClick)

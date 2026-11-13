@@ -9,6 +9,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -64,6 +67,7 @@ fun CameraPreviewView(
     val stabilizerMode by viewModel.stabilizationMode.collectAsState()
     val gyroStrength by viewModel.gyroStabilizerStrength.collectAsState()
     val isGlStabilizerActive by viewModel.isGlStabilizerActive.collectAsState()
+    val isGlFilterActive by viewModel.isGlFilterActive.collectAsState()
     val shakeCancelledDegrees by viewModel.shakeCancelledDegrees.collectAsState()
     val isHwStabEnabled by viewModel.isHardwareStabilizationEnabled.collectAsState()
     val isHwStabSupported by viewModel.isHardwareStabilizationSupported.collectAsState()
@@ -72,6 +76,12 @@ fun CameraPreviewView(
     val shakeCompX by viewModel.shakeCompX.collectAsState()
     val shakeCompY by viewModel.shakeCompY.collectAsState()
     val stabilityScore by viewModel.stabilityScore.collectAsState()
+    val zoomRatio by viewModel.zoomRatio.collectAsState()
+    val minZoomRatio by viewModel.minZoomRatio.collectAsState()
+    val maxZoomRatio by viewModel.maxZoomRatio.collectAsState()
+    val lumaHistogram by viewModel.lumaHistogram.collectAsState()
+    val zebraCells by viewModel.zebraCells.collectAsState()
+    val focusPeakingCells by viewModel.focusPeakingCells.collectAsState()
 
     val isSuperExtremeActive = stabilizerMode == StabilizationMode.SUPER_EXTREME && isHwStabEnabled
     // When CameraEffect GL Gyro EIS is active, the GPU SurfaceProcessor already stabilizes both Preview and recorded VideoCapture frames.
@@ -98,14 +108,39 @@ fun CameraPreviewView(
         }
     }
 
+    // Live viewfinder pixel sampler for real histogram, zebra clipping, and focus peaking
+    LaunchedEffect(isHistogramEnabled, isZebraEnabled, isFocusPeakingEnabled) {
+        while (isHistogramEnabled || isZebraEnabled || isFocusPeakingEnabled) {
+            viewModel.sampleViewfinderTelemetry()
+            delay(250)
+        }
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
             .clipToBounds()
             .background(CinemaBlack)
             .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    do {
+                        val event = awaitPointerEvent()
+                        val pressedCount = event.changes.count { it.pressed }
+                        if (pressedCount >= 2) {
+                            val zoomChange = event.calculateZoom()
+                            if (zoomChange != 1f) {
+                                viewModel.zoomBy(zoomChange)
+                                event.changes.forEach { it.consume() }
+                            }
+                        }
+                    } while (event.changes.any { it.pressed })
+                }
+            }
+            .pointerInput(Unit) {
                 detectTapGestures { offset ->
                     tapFocusPoint = offset
+                    viewModel.tapToFocus(offset.x, offset.y)
                 }
             }
             .testTag("camera_preview_container")
@@ -137,22 +172,28 @@ fun CameraPreviewView(
                 }
         )
 
-        // Live Real-Time Cinematic Color Filter Overlay
-        if (colorFilter != ColorFilterType.NORMAL) {
+        // Fallback Compose preview color tint only when GL LUT shader is not attached
+        if (colorFilter != ColorFilterType.NORMAL && !isGlFilterActive) {
             LiveFilterCanvasOverlay(
                 colorFilter = colorFilter,
                 modifier = Modifier.fillMaxSize()
             )
         }
 
-        // Zebra Stripes / Overexposure warning overlay
+        // Zebra Stripes / Overexposure highlight overlay
         if (isZebraEnabled) {
-            ZebraStripesOverlay(modifier = Modifier.fillMaxSize())
+            ZebraStripesOverlay(
+                zebraCells = zebraCells,
+                modifier = Modifier.fillMaxSize()
+            )
         }
 
-        // Focus Peaking Simulation Overlay
+        // Focus Peaking Contrast Edge Overlay
         if (isFocusPeakingEnabled) {
-            FocusPeakingOverlay(modifier = Modifier.fillMaxSize())
+            FocusPeakingOverlay(
+                peakingCells = focusPeakingCells,
+                modifier = Modifier.fillMaxSize()
+            )
         }
 
         // Framing Grids (Rule of Thirds, Golden Ratio, Crosshair, CinemaScope)
@@ -187,9 +228,25 @@ fun CameraPreviewView(
         // Live Pro Histogram (Top Right)
         if (isHistogramEnabled) {
             HistogramOverlay(
+                lumaBins = lumaHistogram,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
-                    .padding(top = 80.dp, end = 12.dp)
+                    .statusBarsPadding()
+                    .padding(top = 62.dp, end = 12.dp)
+            )
+        }
+
+        // Quick Optical/Digital Zoom Pills (when zoom is supported)
+        if (maxZoomRatio > minZoomRatio + 0.05f) {
+            ZoomControlStrip(
+                currentZoom = zoomRatio,
+                minZoom = minZoomRatio,
+                maxZoom = maxZoomRatio,
+                onSelectZoom = { viewModel.setZoomRatio(it) },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 168.dp)
             )
         }
 
@@ -197,7 +254,8 @@ fun CameraPreviewView(
         Column(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(top = 80.dp, start = 12.dp),
+                .statusBarsPadding()
+                .padding(top = 62.dp, start = 12.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             StabilizerActiveBadge(
@@ -543,35 +601,126 @@ fun HorizonLevelOverlay(roll: Float, pitch: Float, modifier: Modifier = Modifier
 }
 
 @Composable
-fun ZebraStripesOverlay(modifier: Modifier = Modifier) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        val stripeColor = Color.White.copy(alpha = 0.18f)
+fun ZoomControlStrip(
+    currentZoom: Float,
+    minZoom: Float,
+    maxZoom: Float,
+    onSelectZoom: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val presets = buildList {
+        if (minZoom < 0.9f) add(minZoom)
+        add(1.0f)
+        if (maxZoom >= 2.0f) add(2.0f)
+        if (maxZoom >= 4.0f) add(4.0f)
+    }
 
-        var x = 0f
-        while (x < w + h) {
-            drawLine(
-                color = stripeColor,
-                start = Offset(x, 0f),
-                end = Offset(x - h, h),
-                strokeWidth = 2.dp.toPx()
-            )
-            x += 16.dp.toPx()
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(24.dp))
+            .background(CinemaDarkSurface.copy(alpha = 0.78f))
+            .border(1.dp, CinemaBorder, RoundedCornerShape(24.dp))
+            .padding(horizontal = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        presets.forEach { preset ->
+            val isNear = kotlin.math.abs(currentZoom - preset) < 0.25f
+            val label = if (isNear) {
+                "${String.format(java.util.Locale.US, "%.1f", currentZoom)}x"
+            } else if (preset < 1f) {
+                "${String.format(java.util.Locale.US, "%.1f", preset)}x"
+            } else {
+                "${preset.toInt()}x"
+            }
+            Box(
+                modifier = Modifier
+                    .defaultMinSize(minWidth = 44.dp, minHeight = 48.dp)
+                    .clickable { onSelectZoom(preset) }
+                    .testTag("zoom_pill_${preset}"),
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(if (isNear) CinemaAmber else Color.Transparent)
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = label,
+                        color = if (isNear) CinemaBlack else CinemaTextPrimary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
-fun FocusPeakingOverlay(modifier: Modifier = Modifier) {
+fun ZebraStripesOverlay(
+    zebraCells: BooleanArray,
+    modifier: Modifier = Modifier
+) {
+    val cols = com.example.camera.CameraVideoEngine.ANALYSIS_COLS
+    val rows = com.example.camera.CameraVideoEngine.ANALYSIS_ROWS
     Canvas(modifier = modifier) {
-        val cx = size.width / 2f
-        val cy = size.height / 2f
-        drawCircle(
-            color = CinemaGreen.copy(alpha = 0.35f),
-            radius = 120.dp.toPx(),
-            center = Offset(cx, cy),
-            style = Stroke(width = 2.dp.toPx(), pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f)))
-        )
+        if (zebraCells.size < cols * rows) return@Canvas
+        val cellW = size.width / cols
+        val cellH = size.height / rows
+        val stripeColor = Color.White.copy(alpha = 0.45f)
+
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                if (zebraCells[r * cols + c]) {
+                    val x0 = c * cellW
+                    val y0 = r * cellH
+                    drawLine(
+                        color = stripeColor,
+                        start = Offset(x0, y0 + cellH),
+                        end = Offset(x0 + cellW, y0),
+                        strokeWidth = 1.5.dp.toPx()
+                    )
+                    drawLine(
+                        color = stripeColor,
+                        start = Offset(x0, y0 + cellH * 0.5f),
+                        end = Offset(x0 + cellW * 0.5f, y0),
+                        strokeWidth = 1.5.dp.toPx()
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun FocusPeakingOverlay(
+    peakingCells: BooleanArray,
+    modifier: Modifier = Modifier
+) {
+    val cols = com.example.camera.CameraVideoEngine.ANALYSIS_COLS
+    val rows = com.example.camera.CameraVideoEngine.ANALYSIS_ROWS
+    Canvas(modifier = modifier) {
+        if (peakingCells.size < cols * rows) return@Canvas
+        val cellW = size.width / cols
+        val cellH = size.height / rows
+        val peakColor = CinemaGreen.copy(alpha = 0.65f)
+
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                if (peakingCells[r * cols + c]) {
+                    val x0 = c * cellW
+                    val y0 = r * cellH
+                    drawRect(
+                        color = peakColor,
+                        topLeft = Offset(x0 + 2f, y0 + 2f),
+                        size = Size((cellW - 4f).coerceAtLeast(2f), (cellH - 4f).coerceAtLeast(2f)),
+                        style = Stroke(width = 1.5.dp.toPx())
+                    )
+                }
+            }
+        }
     }
 }

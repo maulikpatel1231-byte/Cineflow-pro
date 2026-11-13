@@ -44,6 +44,7 @@ fun CameraScreen(
     val colorFilter by viewModel.colorFilter.collectAsState()
     val activeModal by viewModel.activeModal.collectAsState()
     val isTorchOn by viewModel.isTorchOn.collectAsState()
+    val hasFlashUnit by viewModel.hasFlashUnit.collectAsState()
     val clips by viewModel.clips.collectAsState()
 
     val shutterText = viewModel.engine.shutterSpeeds.getOrNull(shutterIndex)?.first ?: "1/120s"
@@ -123,106 +124,141 @@ fun CameraScreen(
                 }
 
                 // Middle: FPS & Resolution Quick Pill
-                Row(
+                Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(if (fpsMode.isHighSpeed) CinemaAmber.copy(alpha = 0.2f) else CinemaElevatedSurface)
-                        .border(
-                            1.dp,
-                            if (fpsMode.isHighSpeed) CinemaAmber else CinemaBorder,
-                            RoundedCornerShape(20.dp)
-                        )
+                        .defaultMinSize(minHeight = 48.dp)
                         .clickable { viewModel.openModal(ActiveModal.FpsResolutionSelector) }
-                        .padding(horizontal = 12.dp, vertical = 6.dp)
                         .testTag("fps_resolution_pill"),
-                    verticalAlignment = Alignment.CenterVertically
+                    contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        Icons.Default.Speed,
-                        contentDescription = null,
-                        tint = if (fpsMode.isHighSpeed) CinemaAmber else CinemaTextPrimary,
-                        modifier = Modifier.size(14.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "${fpsMode.label} • ${resolutionMode.shortName}",
-                        color = if (fpsMode.isHighSpeed) CinemaAmber else CinemaTextPrimary,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(if (fpsMode.isHighSpeed) CinemaAmber.copy(alpha = 0.2f) else CinemaElevatedSurface)
+                            .border(
+                                1.dp,
+                                if (fpsMode.isHighSpeed) CinemaAmber else CinemaBorder,
+                                RoundedCornerShape(20.dp)
+                            )
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Speed,
+                            contentDescription = "FPS and Resolution",
+                            tint = if (fpsMode.isHighSpeed) CinemaAmber else CinemaTextPrimary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "${fpsMode.label} • ${resolutionMode.shortName}",
+                            color = if (fpsMode.isHighSpeed) CinemaAmber else CinemaTextPrimary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
+                        )
+                    }
                 }
 
-                // Top Actions (Stab, Torch, Flip, Assists)
+                // Top Actions (Stab, Torch, Flip, Assists) with >= 48dp accessible touch height
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     // Stabilizer Button
                     IconButton(
                         onClick = { viewModel.openModal(ActiveModal.StabilizerSelector) },
                         modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(if (stabilizationMode.label != "Off") CinemaCyan.copy(alpha = 0.2f) else CinemaElevatedSurface)
+                            .size(44.dp)
                             .testTag("stabilizer_btn")
                     ) {
-                        Icon(
-                            Icons.Default.MotionPhotosOn,
-                            contentDescription = "Stabilizer",
-                            tint = if (stabilizationMode.label != "Off") CinemaCyan else CinemaTextSecondary,
-                            modifier = Modifier.size(18.dp)
-                        )
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(if (stabilizationMode.label != "Off") CinemaCyan.copy(alpha = 0.2f) else CinemaElevatedSurface),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Default.MotionPhotosOn,
+                                contentDescription = "Stabilizer",
+                                tint = if (stabilizationMode.label != "Off") CinemaCyan else CinemaTextSecondary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
 
                     // Torch Button
                     IconButton(
                         onClick = { viewModel.toggleTorch() },
                         modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(if (isTorchOn) CinemaAmber.copy(alpha = 0.25f) else CinemaElevatedSurface)
+                            .size(44.dp)
                             .testTag("torch_btn")
                     ) {
-                        Icon(
-                            imageVector = if (isTorchOn) Icons.Default.FlashOn else Icons.Default.FlashOff,
-                            contentDescription = "Torch",
-                            tint = if (isTorchOn) CinemaAmber else CinemaTextSecondary,
-                            modifier = Modifier.size(18.dp)
-                        )
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(if (isTorchOn && hasFlashUnit) CinemaAmber.copy(alpha = 0.25f) else CinemaElevatedSurface),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = if (isTorchOn && hasFlashUnit) Icons.Default.FlashOn else Icons.Default.FlashOff,
+                                contentDescription = "Torch",
+                                tint = when {
+                                    isTorchOn && hasFlashUnit -> CinemaAmber
+                                    !hasFlashUnit -> CinemaTextMuted
+                                    else -> CinemaTextSecondary
+                                },
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
 
                     // Switch Camera
                     IconButton(
                         onClick = { viewModel.switchCamera() },
                         modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(CinemaElevatedSurface)
+                            .size(44.dp)
                             .testTag("switch_cam_btn")
                     ) {
-                        Icon(
-                            Icons.Default.FlipCameraAndroid,
-                            contentDescription = "Flip Camera",
-                            tint = CinemaTextSecondary,
-                            modifier = Modifier.size(18.dp)
-                        )
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(CinemaElevatedSurface),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Default.FlipCameraAndroid,
+                                contentDescription = "Flip Camera",
+                                tint = if (isRecording) CinemaTextMuted else CinemaTextSecondary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
 
                     // Viewfinder Assists & Grids
                     IconButton(
                         onClick = { viewModel.openModal(ActiveModal.ProSettingsDialog) },
                         modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .background(CinemaElevatedSurface)
+                            .size(44.dp)
                             .testTag("pro_assists_btn")
                     ) {
-                        Icon(
-                            Icons.Default.Tune,
-                            contentDescription = "Tools",
-                            tint = CinemaTextSecondary,
-                            modifier = Modifier.size(18.dp)
-                        )
+                        Box(
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .background(CinemaElevatedSurface),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Default.Tune,
+                                contentDescription = "Tools",
+                                tint = CinemaTextSecondary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -232,7 +268,9 @@ fun CameraScreen(
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 120.dp)
+                .navigationBarsPadding()
+                .padding(bottom = 114.dp)
+                .defaultMinSize(minHeight = 48.dp)
                 .clip(RoundedCornerShape(24.dp))
                 .background(CinemaDarkSurface.copy(alpha = 0.88f))
                 .border(1.dp, CinemaBorder, RoundedCornerShape(24.dp))

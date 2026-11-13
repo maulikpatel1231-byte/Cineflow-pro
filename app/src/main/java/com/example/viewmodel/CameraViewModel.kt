@@ -57,7 +57,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     val isPreviewStabilizationSupported: StateFlow<Boolean> = engine.isPreviewStabilizationSupported
     val isHardwareStabilizationActive: StateFlow<Boolean> = engine.isHardwareStabilizationActive
     val isGlStabilizerActive: StateFlow<Boolean> = engine.isGlStabilizerActive
+    val isGlFilterActive: StateFlow<Boolean> = engine.isGlFilterActive
+    val hasFlashUnit: StateFlow<Boolean> = engine.hasFlashUnit
     val shakeCancelledDegrees: StateFlow<Float> = engine.shakeCancelledDegrees
+    val zoomRatio: StateFlow<Float> = engine.zoomRatio
+    val minZoomRatio: StateFlow<Float> = engine.minZoomRatio
+    val maxZoomRatio: StateFlow<Float> = engine.maxZoomRatio
+    val lumaHistogram: StateFlow<List<Float>> = engine.lumaHistogram
+    val zebraCells: StateFlow<BooleanArray> = engine.zebraCells
+    val focusPeakingCells: StateFlow<BooleanArray> = engine.focusPeakingCells
 
     private val _exposureMode = MutableStateFlow(ExposureMode.AUTO)
     val exposureMode: StateFlow<ExposureMode> = _exposureMode.asStateFlow()
@@ -138,6 +146,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     val clips = repository.clips
 
     fun navigateTo(screen: String) {
+        if (screen != "camera" && isRecording.value) {
+            engine.stopRecording()
+        }
+        _activeModal.value = ActiveModal.None
         _currentScreen.value = screen
     }
 
@@ -158,13 +170,27 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setFpsMode(mode: FpsMode) {
+        if (isRecording.value) {
+            showToast("Stop recording to change frame rate")
+            return
+        }
         _fpsMode.value = mode
         engine.fpsMode = mode
         engine.bindCameraUseCases()
-        showToast("${mode.label} selected (${mode.slowMoMultiplier})")
+        val maxHwFps = (_hardwareInfo.value.availableAeFpsRanges.maxOfOrNull { it.upper } ?: 30)
+            .coerceAtLeast(if (_hardwareInfo.value.supportsHighSpeed240) 240 else if (_hardwareInfo.value.supportsHighSpeed120) 120 else 30)
+        if (mode.fps > maxHwFps) {
+            showToast("${mode.label} selected (sensor caps AE at ${maxHwFps} FPS)")
+        } else {
+            showToast("${mode.label} selected (${mode.slowMoMultiplier})")
+        }
     }
 
     fun setResolutionMode(mode: ResolutionMode) {
+        if (isRecording.value) {
+            showToast("Stop recording to change resolution")
+            return
+        }
         _resolutionMode.value = mode
         engine.resolutionMode = mode
         engine.bindCameraUseCases()
@@ -299,44 +325,58 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setManualIso(iso: Int) {
-        _manualIso.value = iso
-        engine.manualIso = iso
+        val hw = _hardwareInfo.value
+        val clamped = iso.coerceIn(hw.minIso, hw.maxIso.coerceAtLeast(hw.minIso))
+        _manualIso.value = clamped
+        engine.manualIso = clamped
         engine.updateLiveControls()
     }
 
     fun setShutterIndex(index: Int) {
-        _manualShutterIndex.value = index
-        engine.manualShutterSpeedIndex = index
+        val clampedIdx = index.coerceIn(0, engine.shutterSpeeds.lastIndex)
+        _manualShutterIndex.value = clampedIdx
+        engine.manualShutterSpeedIndex = clampedIdx
         engine.updateLiveControls()
     }
 
     fun setManualEv(ev: Float) {
-        _manualEv.value = ev
-        engine.manualEvCompensation = ev
+        val hw = _hardwareInfo.value
+        val minEvFloat = (hw.minEv * hw.evStep).coerceAtMost(-0.5f)
+        val maxEvFloat = (hw.maxEv * hw.evStep).coerceAtLeast(0.5f)
+        val clamped = ev.coerceIn(minEvFloat, maxEvFloat)
+        _manualEv.value = clamped
+        engine.manualEvCompensation = clamped
         engine.updateLiveControls()
     }
 
     fun setFocusMode(mode: FocusMode) {
+        if (mode == FocusMode.MANUAL && _hardwareInfo.value.maxFocusDistance <= 0f) {
+            showToast("Fixed-focus lens: manual diopter distance unsupported")
+        }
         _focusMode.value = mode
         engine.focusMode = mode
         engine.updateLiveControls()
     }
 
     fun setManualFocusDistance(distance: Float) {
-        _manualFocusDistance.value = distance
-        engine.manualFocusDistance = distance
+        val clamped = distance.coerceIn(0f, 1f)
+        _manualFocusDistance.value = clamped
+        engine.manualFocusDistance = clamped
         engine.updateLiveControls()
     }
 
     fun setWhiteBalance(wb: WhiteBalanceMode) {
         _whiteBalanceMode.value = wb
         engine.whiteBalanceMode = wb
-        engine.bindCameraUseCases()
+        engine.updateLiveControls()
     }
 
     fun setColorFilter(filter: ColorFilterType) {
         _colorFilter.value = filter
-        engine.currentColorFilter = filter
+        engine.setLiveColorFilter(filter)
+        if (isRecording.value && !isGlFilterActive.value && filter != ColorFilterType.NORMAL) {
+            showToast("LUT preview only during active recording")
+        }
     }
 
     fun setGridType(grid: GridType) {
@@ -366,24 +406,57 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun toggleTorch() {
+        if (!hasFlashUnit.value) {
+            _isTorchOn.value = false
+            engine.isFlashTorchOn = false
+            showToast("Torch unavailable on this camera lens")
+            return
+        }
         _isTorchOn.value = !_isTorchOn.value
         engine.isFlashTorchOn = _isTorchOn.value
         engine.updateLiveControls()
     }
 
     fun switchCamera() {
+        if (isRecording.value) {
+            showToast("Stop recording to switch camera")
+            return
+        }
         _isFrontCamera.value = !_isFrontCamera.value
         engine.isFrontCamera = _isFrontCamera.value
+        _isTorchOn.value = false
+        engine.isFlashTorchOn = false
+        _hardwareInfo.value = CameraHardwareHelper.queryCameraCapabilities(
+            getApplication(),
+            _isFrontCamera.value
+        )
         engine.bindCameraUseCases()
+    }
+
+    fun tapToFocus(x: Float, y: Float) {
+        engine.tapToFocus(x, y)
+    }
+
+    fun setZoomRatio(ratio: Float) {
+        engine.setZoomRatio(ratio)
+    }
+
+    fun zoomBy(scaleFactor: Float) {
+        engine.zoomBy(scaleFactor)
+    }
+
+    fun sampleViewfinderTelemetry() {
+        engine.analyzePreviewFrame(
+            computeHistogram = _isHistogramEnabled.value,
+            computeZebra = _isZebraEnabled.value,
+            computeFocusPeaking = _isFocusPeakingEnabled.value
+        )
     }
 
     fun toggleRecording() {
         if (isRecording.value) {
-            val clip = engine.stopRecording()
-            if (clip != null) {
-                repository.addClip(clip)
-                showToast("Recorded ${clip.durationSeconds}s @ ${clip.fps} FPS")
-            }
+            engine.stopRecording()
+            showToast("Finalizing recording...")
         } else {
             engine.startRecording(
                 onSuccess = { _ ->

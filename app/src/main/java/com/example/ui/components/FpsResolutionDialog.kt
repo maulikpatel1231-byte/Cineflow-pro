@@ -33,6 +33,15 @@ fun FpsResolutionDialog(
     val activeFps by viewModel.fpsMode.collectAsState()
     val activeRes by viewModel.resolutionMode.collectAsState()
     val hwInfo by viewModel.hardwareInfo.collectAsState()
+    val isRecording by viewModel.isRecording.collectAsState()
+
+    val maxSensorFps = (hwInfo.availableAeFpsRanges.maxOfOrNull { it.upper } ?: 30).coerceAtLeast(
+        when {
+            hwInfo.supportsHighSpeed240 -> 240
+            hwInfo.supportsHighSpeed120 -> 120
+            else -> 30
+        }
+    )
 
     Card(
         modifier = Modifier
@@ -71,8 +80,9 @@ fun FpsResolutionDialog(
                             letterSpacing = 0.5.sp
                         )
                         Text(
-                            text = "High-speed 120-240 FPS & HD Video",
-                            color = CinemaTextSecondary,
+                            text = if (isRecording) "Stop recording to switch stream format"
+                            else "${hwInfo.facing} • Max ${maxSensorFps} FPS",
+                            color = if (isRecording) CinemaRed else CinemaTextSecondary,
                             fontSize = 11.sp
                         )
                     }
@@ -96,15 +106,17 @@ fun FpsResolutionDialog(
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 FpsMode.values().forEach { mode ->
                     val isSelected = activeFps == mode
-                    val isSupported = when (mode) {
-                        FpsMode.FPS_120 -> hwInfo.supportsHighSpeed120
-                        FpsMode.FPS_240 -> hwInfo.supportsHighSpeed240
-                        else -> true
+                    val isNativeSupported = when (mode) {
+                        FpsMode.FPS_240 -> hwInfo.supportsHighSpeed240 || maxSensorFps >= 240
+                        FpsMode.FPS_120 -> hwInfo.supportsHighSpeed120 || maxSensorFps >= 120
+                        FpsMode.FPS_60 -> maxSensorFps >= 60
+                        FpsMode.FPS_30 -> true
                     }
 
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .defaultMinSize(minHeight = 48.dp)
                             .clip(RoundedCornerShape(10.dp))
                             .background(if (isSelected) CinemaAmber.copy(alpha = 0.15f) else CinemaElevatedSurface)
                             .border(
@@ -112,14 +124,12 @@ fun FpsResolutionDialog(
                                 color = if (isSelected) CinemaAmber else CinemaBorder,
                                 shape = RoundedCornerShape(10.dp)
                             )
-                            .clickable {
-                                viewModel.setFpsMode(mode)
-                            }
+                            .clickable { viewModel.setFpsMode(mode) }
                             .padding(horizontal = 14.dp, vertical = 10.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     text = mode.label,
@@ -128,20 +138,30 @@ fun FpsResolutionDialog(
                                     fontSize = 14.sp
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
-                                if (mode.isHighSpeed) {
-                                    Box(
-                                        modifier = Modifier
-                                            .clip(RoundedCornerShape(4.dp))
-                                            .background(if (mode == FpsMode.FPS_240) CinemaRed else CinemaCyan)
-                                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                                    ) {
-                                        Text(
-                                            text = if (mode == FpsMode.FPS_240) "ULTRA HIGH-SPEED" else "HIGH-SPEED",
-                                            color = Color.Black,
-                                            fontSize = 9.sp,
-                                            fontWeight = FontWeight.Bold
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(
+                                            when {
+                                                !isNativeSupported -> CinemaBorder
+                                                mode == FpsMode.FPS_240 -> CinemaRed
+                                                mode == FpsMode.FPS_120 -> CinemaCyan
+                                                else -> CinemaGreen
+                                            }
                                         )
-                                    }
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = when {
+                                            !isNativeSupported -> "CAPS TO ${maxSensorFps}F"
+                                            mode == FpsMode.FPS_240 -> "NATIVE 240F"
+                                            mode == FpsMode.FPS_120 -> "NATIVE 120F"
+                                            else -> "NATIVE"
+                                        },
+                                        color = if (isNativeSupported) Color.Black else CinemaTextPrimary,
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
                                 }
                             }
                             Text(
@@ -183,6 +203,7 @@ fun FpsResolutionDialog(
                     Box(
                         modifier = Modifier
                             .weight(1f)
+                            .defaultMinSize(minHeight = 48.dp)
                             .clip(RoundedCornerShape(10.dp))
                             .background(if (isSelected) CinemaCyan else CinemaElevatedSurface)
                             .clickable { viewModel.setResolutionMode(res) }
@@ -217,7 +238,7 @@ fun FpsResolutionDialog(
                     .padding(8.dp)
             ) {
                 Text(
-                    text = "Tip: 120 & 240 FPS high-speed capture uses HD 720p/1080p sensor stream. Stabilization (OIS/EIS) remains active across all frame rates.",
+                    text = "Tip: CameraX automatically negotiates the highest supported sensor FPS range (${maxSensorFps} FPS max on this lens) with Video Stabilization active.",
                     color = CinemaTextMuted,
                     fontSize = 10.sp
                 )

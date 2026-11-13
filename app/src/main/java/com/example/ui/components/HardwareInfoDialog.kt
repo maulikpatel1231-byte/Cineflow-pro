@@ -119,8 +119,25 @@ fun HardwareInfoDialog(
                 highlight = true
             )
             SpecItem(label = "ISO Sensitivity Range", value = "${hwInfo.minIso} - ${hwInfo.maxIso}")
-            SpecItem(label = "Exposure Time Range", value = "1/10000s - 1s")
+            val minExpStr = if (hwInfo.minExposureTimeNs > 0L) {
+                "1/${(1_000_000_000L / hwInfo.minExposureTimeNs).coerceAtLeast(1L)}s"
+            } else "N/A"
+            val maxExpStr = if (hwInfo.maxExposureTimeNs >= 1_000_000_000L) {
+                "${String.format(java.util.Locale.US, "%.1f", hwInfo.maxExposureTimeNs / 1_000_000_000.0)}s"
+            } else {
+                "1/${(1_000_000_000L / hwInfo.maxExposureTimeNs.coerceAtLeast(1L)).coerceAtLeast(1L)}s"
+            }
+            SpecItem(label = "Exposure Time Range", value = "$minExpStr - $maxExpStr")
             SpecItem(label = "EV Exposure Steps", value = "${hwInfo.evStep} EV (Range: ${hwInfo.minEv} to ${hwInfo.maxEv})")
+            SpecItem(
+                label = "Manual Focus Range",
+                value = if (hwInfo.maxFocusDistance > 0f) {
+                    "0.0 - ${String.format(java.util.Locale.US, "%.1f", hwInfo.maxFocusDistance)} diopters (MF Ready)"
+                } else {
+                    "Fixed-Focus Lens"
+                },
+                highlight = hwInfo.maxFocusDistance > 0f
+            )
 
             Spacer(modifier = Modifier.height(14.dp))
 
