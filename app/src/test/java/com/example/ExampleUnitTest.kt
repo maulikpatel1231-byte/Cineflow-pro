@@ -32,6 +32,7 @@ class ExampleUnitTest {
         assertEquals("OIS", StabilizationMode.OIS.label)
         assertEquals("EIS", StabilizationMode.EIS.label)
         assertEquals("Hybrid Pro", StabilizationMode.HYBRID.label)
+        assertEquals("Super Extreme", StabilizationMode.SUPER_EXTREME.label)
     }
 
     @Test

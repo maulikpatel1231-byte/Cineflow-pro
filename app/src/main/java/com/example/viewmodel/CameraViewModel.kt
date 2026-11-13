@@ -44,7 +44,11 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _isHardwareStabilizationEnabled = MutableStateFlow(true)
     val isHardwareStabilizationEnabled: StateFlow<Boolean> = _isHardwareStabilizationEnabled.asStateFlow()
 
+    private val _isHorizonLockEnabled = MutableStateFlow(true)
+    val isHorizonLockEnabled: StateFlow<Boolean> = _isHorizonLockEnabled.asStateFlow()
+
     val isHardwareStabilizationSupported: StateFlow<Boolean> = engine.isHardwareStabilizationSupported
+    val isPreviewStabilizationSupported: StateFlow<Boolean> = engine.isPreviewStabilizationSupported
     val isHardwareStabilizationActive: StateFlow<Boolean> = engine.isHardwareStabilizationActive
 
     private val _exposureMode = MutableStateFlow(ExposureMode.AUTO)
@@ -118,6 +122,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     val rollDegrees = engine.rollDegrees
     val pitchDegrees = engine.pitchDegrees
     val stabilizerDamping = engine.stabilizerDamping
+    val horizonLockAngle = engine.horizonLockAngle
+    val shakeCompX = engine.shakeCompX
+    val shakeCompY = engine.shakeCompY
+    val stabilityScore = engine.stabilityScore
 
     val clips = repository.clips
 
@@ -160,17 +168,42 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             showToast("Stop recording to change stabilization mode")
             return
         }
+        val previousMode = _stabilizationMode.value
         _stabilizationMode.value = mode
         engine.stabilizationMode = mode
         val shouldEnableHw = mode != StabilizationMode.OFF
-        if (_isHardwareStabilizationEnabled.value != shouldEnableHw) {
-            _isHardwareStabilizationEnabled.value = shouldEnableHw
-            engine.isHardwareVideoStabilizationEnabled = shouldEnableHw
+        val needsRebind =
+            _isHardwareStabilizationEnabled.value != shouldEnableHw ||
+                previousMode == StabilizationMode.SUPER_EXTREME ||
+                mode == StabilizationMode.SUPER_EXTREME
+        _isHardwareStabilizationEnabled.value = shouldEnableHw
+        engine.isHardwareVideoStabilizationEnabled = shouldEnableHw
+        if (needsRebind) {
             engine.bindCameraUseCases()
         } else {
             engine.updateLiveControls()
         }
-        showToast("Stabilizer: ${mode.label}")
+        val toastText = if (mode == StabilizationMode.SUPER_EXTREME) {
+            "Super Extreme Gimbal Stability ON"
+        } else {
+            "Stabilizer: ${mode.label}"
+        }
+        showToast(toastText)
+    }
+
+    fun toggleSuperExtremeStability() {
+        val nextMode = if (_stabilizationMode.value == StabilizationMode.SUPER_EXTREME) {
+            StabilizationMode.HYBRID
+        } else {
+            StabilizationMode.SUPER_EXTREME
+        }
+        setStabilizationMode(nextMode)
+    }
+
+    fun toggleHorizonLock(enabled: Boolean = !_isHorizonLockEnabled.value) {
+        _isHorizonLockEnabled.value = enabled
+        engine.isHorizonLockEnabled = enabled
+        showToast(if (enabled) "Active Horizon Lock: ON (±18°)" else "Active Horizon Lock: OFF")
     }
 
     fun toggleHardwareStabilization(enabled: Boolean = !_isHardwareStabilizationEnabled.value) {

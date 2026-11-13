@@ -38,7 +38,10 @@ fun StabilizerSelector(
     val activeMode by viewModel.stabilizationMode.collectAsState()
     val isHwStabEnabled by viewModel.isHardwareStabilizationEnabled.collectAsState()
     val isHwStabSupported by viewModel.isHardwareStabilizationSupported.collectAsState()
+    val isPreviewStabSupported by viewModel.isPreviewStabilizationSupported.collectAsState()
     val isHwStabActive by viewModel.isHardwareStabilizationActive.collectAsState()
+    val isHorizonLockEnabled by viewModel.isHorizonLockEnabled.collectAsState()
+    val stabilityScore by viewModel.stabilityScore.collectAsState()
     val rollDegrees by viewModel.rollDegrees.collectAsState()
     val pitchDegrees by viewModel.pitchDegrees.collectAsState()
     val damping by viewModel.stabilizerDamping.collectAsState()
@@ -184,15 +187,15 @@ fun StabilizerSelector(
                     horizontalAlignment = Alignment.End
                 ) {
                     Text(
-                        text = "DAMPING EFFICIENCY",
+                        text = "SMOOTHNESS SCORE",
                         color = CinemaTextMuted,
                         fontSize = 8.sp,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "${(damping * 100).toInt()}%",
-                        color = CinemaGreen,
-                        fontSize = 13.sp,
+                        text = "${stabilityScore}%",
+                        color = if (stabilityScore >= 95) CinemaGreen else CinemaCyan,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Bold
                     )
                 }
@@ -250,39 +253,97 @@ fun StabilizerSelector(
                 )
             }
 
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Active Horizon Lock Toggle (±18° Gimbal Leveling)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(
+                        if (isHorizonLockEnabled && activeMode == StabilizationMode.SUPER_EXTREME)
+                            CinemaGreen.copy(alpha = 0.14f)
+                        else CinemaElevatedSurface
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (isHorizonLockEnabled && activeMode == StabilizationMode.SUPER_EXTREME)
+                            CinemaGreen
+                        else CinemaBorder,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    .clickable { viewModel.toggleHorizonLock(!isHorizonLockEnabled) }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(
+                        text = "Active Horizon Lock (±18° Gimbal)",
+                        color = if (isHorizonLockEnabled) CinemaGreen else CinemaTextPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = if (activeMode == StabilizationMode.SUPER_EXTREME) {
+                            "Live gyro horizon counter-rotation & 1.18x overscan crop"
+                        } else {
+                            "Auto-engages in Super Extreme mode"
+                        },
+                        color = CinemaTextSecondary,
+                        fontSize = 11.sp
+                    )
+                }
+                Switch(
+                    checked = isHorizonLockEnabled,
+                    onCheckedChange = { viewModel.toggleHorizonLock(it) },
+                    modifier = Modifier.testTag("horizon_lock_switch"),
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = CinemaBlack,
+                        checkedTrackColor = CinemaGreen,
+                        uncheckedThumbColor = CinemaTextSecondary,
+                        uncheckedTrackColor = CinemaDarkSurface
+                    )
+                )
+            }
+
             Spacer(modifier = Modifier.height(12.dp))
 
             // Modes List
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 StabilizationMode.values().forEach { mode ->
                     val isSelected = activeMode == mode
+                    val isSuper = mode == StabilizationMode.SUPER_EXTREME
+                    val accentColor = if (isSuper) CinemaGreen else CinemaCyan
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(10.dp))
-                            .background(if (isSelected) CinemaCyan.copy(alpha = 0.15f) else CinemaElevatedSurface)
+                            .background(if (isSelected) accentColor.copy(alpha = 0.16f) else CinemaElevatedSurface)
                             .border(
                                 width = if (isSelected) 1.5.dp else 1.dp,
-                                color = if (isSelected) CinemaCyan else CinemaBorder,
+                                color = if (isSelected) accentColor else CinemaBorder,
                                 shape = RoundedCornerShape(10.dp)
                             )
                             .clickable { viewModel.setStabilizationMode(mode) }
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                            .padding(horizontal = 14.dp, vertical = 10.dp)
+                            .testTag("stab_mode_${mode.name.lowercase()}"),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     text = mode.label,
-                                    color = if (isSelected) CinemaCyan else CinemaTextPrimary,
+                                    color = if (isSelected) accentColor else CinemaTextPrimary,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 13.sp
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
                                     text = "(${mode.iconName})",
-                                    color = CinemaTextMuted,
+                                    color = if (isSuper) CinemaGreen else CinemaTextMuted,
                                     fontSize = 11.sp
                                 )
                             }
@@ -297,7 +358,7 @@ fun StabilizerSelector(
                             selected = isSelected,
                             onClick = { viewModel.setStabilizationMode(mode) },
                             colors = RadioButtonDefaults.colors(
-                                selectedColor = CinemaCyan,
+                                selectedColor = accentColor,
                                 unselectedColor = CinemaTextMuted
                             )
                         )
@@ -308,7 +369,7 @@ fun StabilizerSelector(
             Spacer(modifier = Modifier.height(12.dp))
 
             Text(
-                text = "Hardware status: OIS ${if (hwInfo.supportsOis) "Ready (Lens Gyro Shift)" else "Emulated / Software"} • EIS ${if (hwInfo.supportsEis) "Ready (Sensor Flow Crop)" else "Active"}",
+                text = "Hardware: OIS ${if (hwInfo.supportsOis) "Ready" else "Emulated"} • EIS ${if (hwInfo.supportsEis) "Ready" else "Active"} • Action Preview ${if (isPreviewStabSupported || hwInfo.supportsPreviewStabilization) "Ready" else "Enhanced Crop"}",
                 color = CinemaTextMuted,
                 fontSize = 10.sp
             )

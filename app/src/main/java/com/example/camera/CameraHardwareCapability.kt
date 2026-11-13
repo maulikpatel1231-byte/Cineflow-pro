@@ -17,6 +17,7 @@ data class CameraHardwareInfo(
     val supportsHighSpeed240: Boolean,
     val supportsOis: Boolean,
     val supportsEis: Boolean,
+    val supportsPreviewStabilization: Boolean,
     val minIso: Int,
     val maxIso: Int,
     val minExposureTimeNs: Long,
@@ -102,6 +103,11 @@ object CameraHardwareHelper {
 
             val videoStabilizationModes = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: intArrayOf()
             val supportsEis = videoStabilizationModes.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+            val supportsPreviewStab = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                videoStabilizationModes.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION)
+            } else {
+                false
+            }
 
             val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(50, 3200)
             val expTimeRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: Range(100_000L, 1_000_000_000L)
@@ -118,6 +124,7 @@ object CameraHardwareHelper {
                 supportsHighSpeed240 = has240,
                 supportsOis = supportsOis,
                 supportsEis = supportsEis,
+                supportsPreviewStabilization = supportsPreviewStab,
                 minIso = isoRange.lower,
                 maxIso = isoRange.upper,
                 minExposureTimeNs = expTimeRange.lower,
@@ -143,6 +150,7 @@ object CameraHardwareHelper {
             supportsHighSpeed240 = true,
             supportsOis = true,
             supportsEis = true,
+            supportsPreviewStabilization = true,
             minIso = 50,
             maxIso = 6400,
             minExposureTimeNs = 100_000L,

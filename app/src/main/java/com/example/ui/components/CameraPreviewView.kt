@@ -2,6 +2,9 @@ package com.example.ui.components
 
 import android.view.ViewGroup
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -11,6 +14,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.MotionPhotosOff
 import androidx.compose.material.icons.filled.MotionPhotosOn
 import androidx.compose.material3.Icon
@@ -20,6 +24,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.*
@@ -34,6 +39,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.model.ColorFilterType
 import com.example.model.GridType
+import com.example.model.StabilizationMode
 import com.example.ui.theme.*
 import com.example.viewmodel.CameraViewModel
 import kotlinx.coroutines.delay
@@ -57,6 +63,24 @@ fun CameraPreviewView(
     val stabilizerMode by viewModel.stabilizationMode.collectAsState()
     val isHwStabEnabled by viewModel.isHardwareStabilizationEnabled.collectAsState()
     val isHwStabSupported by viewModel.isHardwareStabilizationSupported.collectAsState()
+    val isHorizonLockEnabled by viewModel.isHorizonLockEnabled.collectAsState()
+    val horizonLockAngle by viewModel.horizonLockAngle.collectAsState()
+    val shakeCompX by viewModel.shakeCompX.collectAsState()
+    val shakeCompY by viewModel.shakeCompY.collectAsState()
+    val stabilityScore by viewModel.stabilityScore.collectAsState()
+
+    val isSuperExtremeActive = stabilizerMode == StabilizationMode.SUPER_EXTREME && isHwStabEnabled
+    val targetScale = if (isSuperExtremeActive && isHorizonLockEnabled) 1.18f else if (isSuperExtremeActive) 1.08f else 1.0f
+    val animatedScale by animateFloatAsState(
+        targetValue = targetScale,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "gimbal_overscan"
+    )
+    val animatedRotation by animateFloatAsState(
+        targetValue = if (isSuperExtremeActive && isHorizonLockEnabled) horizonLockAngle else 0f,
+        animationSpec = spring(stiffness = Spring.StiffnessMedium),
+        label = "horizon_lock_rotation"
+    )
 
     var tapFocusPoint by remember { mutableStateOf<Offset?>(null) }
 
@@ -70,6 +94,7 @@ fun CameraPreviewView(
     Box(
         modifier = modifier
             .fillMaxSize()
+            .clipToBounds()
             .background(CinemaBlack)
             .pointerInput(Unit) {
                 detectTapGestures { offset ->
@@ -78,7 +103,7 @@ fun CameraPreviewView(
             }
             .testTag("camera_preview_container")
     ) {
-        // CameraX PreviewView hosted inside AndroidView
+        // CameraX PreviewView hosted inside AndroidView with real-time gimbal horizon-lock & micro-shake damping
         AndroidView(
             factory = { ctx ->
                 PreviewView(ctx).apply {
@@ -86,6 +111,7 @@ fun CameraPreviewView(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
+                    implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                     scaleType = PreviewView.ScaleType.FILL_CENTER
                     viewModel.engine.startCamera(
                         lifecycleOwner = lifecycleOwner,
@@ -93,7 +119,15 @@ fun CameraPreviewView(
                     )
                 }
             },
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = animatedScale
+                    scaleY = animatedScale
+                    rotationZ = animatedRotation
+                    translationX = if (isSuperExtremeActive) shakeCompX else 0f
+                    translationY = if (isSuperExtremeActive) shakeCompY else 0f
+                }
         )
 
         // Live Real-Time Cinematic Color Filter Overlay
@@ -152,17 +186,27 @@ fun CameraPreviewView(
             )
         }
 
-        // Interactive CameraX VideoCapture Hardware Stabilization Toggle Pill
-        StabilizerActiveBadge(
-            modeLabel = stabilizerMode.label,
-            isHwStabEnabled = isHwStabEnabled,
-            isHwStabSupported = isHwStabSupported,
-            isRecording = isRecording,
-            onToggle = { viewModel.toggleHardwareStabilization() },
+        // Interactive CameraX VideoCapture Hardware Stabilization & Super Extreme Gimbal Pills
+        Column(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(top = 80.dp, start = 12.dp)
-        )
+                .padding(top = 80.dp, start = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            StabilizerActiveBadge(
+                modeLabel = stabilizerMode.label,
+                isHwStabEnabled = isHwStabEnabled,
+                isHwStabSupported = isHwStabSupported,
+                isRecording = isRecording,
+                onToggle = { viewModel.toggleHardwareStabilization() }
+            )
+            SuperExtremePill(
+                isActive = isSuperExtremeActive,
+                stabilityScore = stabilityScore,
+                isHorizonLockEnabled = isHorizonLockEnabled,
+                onToggle = { viewModel.toggleSuperExtremeStability() }
+            )
+        }
     }
 }
 
@@ -293,6 +337,60 @@ fun StabilizerActiveBadge(
             Text(
                 text = statusText,
                 color = if (isHwStabEnabled) CinemaTextPrimary else CinemaTextMuted,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+    }
+}
+
+@Composable
+fun SuperExtremePill(
+    isActive: Boolean,
+    stabilityScore: Int,
+    isHorizonLockEnabled: Boolean,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .defaultMinSize(minHeight = 48.dp)
+            .semantics(mergeDescendants = true) {}
+            .clickable(onClick = onToggle)
+            .testTag("super_extreme_toggle"),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .background(
+                    if (isActive) CinemaGreen.copy(alpha = 0.2f)
+                    else CinemaDarkSurface.copy(alpha = 0.8f)
+                )
+                .border(
+                    width = 1.dp,
+                    color = if (isActive) CinemaGreen else CinemaBorder,
+                    shape = RoundedCornerShape(8.dp)
+                )
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.Default.AutoFixHigh,
+                contentDescription = if (isActive) "Super Extreme stability active" else "Enable Super Extreme stability",
+                tint = if (isActive) CinemaGreen else CinemaTextSecondary,
+                modifier = Modifier.size(14.dp)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = if (isActive) {
+                    val lockText = if (isHorizonLockEnabled) " • LOCK" else ""
+                    "EXTREME ${stabilityScore}%$lockText"
+                } else {
+                    "EXTREME SMOOTH"
+                },
+                color = if (isActive) CinemaGreen else CinemaTextSecondary,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Bold,
                 style = MaterialTheme.typography.labelSmall

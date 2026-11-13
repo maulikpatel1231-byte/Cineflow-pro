@@ -31,6 +31,7 @@ fun HardwareInfoDialog(
 ) {
     val hwInfo by viewModel.hardwareInfo.collectAsState()
     val isCameraXStabSupported by viewModel.isHardwareStabilizationSupported.collectAsState()
+    val isPreviewStabSupported by viewModel.isPreviewStabilizationSupported.collectAsState()
 
     Card(
         modifier = Modifier
@@ -102,6 +103,15 @@ fun HardwareInfoDialog(
                 label = "CameraX VideoCapture HW Stabilization",
                 value = if (isCameraXStabSupported) "Supported (VideoCapabilities.isStabilizationSupported)" else "Not reported on current lens",
                 highlight = isCameraXStabSupported
+            )
+            SpecItem(
+                label = "Super Extreme Preview / Action Stabilization",
+                value = if (isPreviewStabSupported || hwInfo.supportsPreviewStabilization) {
+                    "Supported (PreviewCapabilities + API 33+ Action Mode)"
+                } else {
+                    "Enhanced via Gyro Sensor Fusion + Horizon Lock"
+                },
+                highlight = true
             )
             SpecItem(label = "ISO Sensitivity Range", value = "${hwInfo.minIso} - ${hwInfo.maxIso}")
             SpecItem(label = "Exposure Time Range", value = "1/10000s - 1s")

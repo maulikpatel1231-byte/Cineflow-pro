@@ -43,4 +43,24 @@ class ExampleRobolectricTest {
     assertTrue(viewModel.engine.isHardwareVideoStabilizationEnabled)
     assertEquals(StabilizationMode.HYBRID, viewModel.stabilizationMode.value)
   }
+
+  @Test
+  fun `super extreme stability and horizon lock toggles update state`() {
+    val app = ApplicationProvider.getApplicationContext<Application>()
+    val viewModel = CameraViewModel(app)
+
+    assertEquals(StabilizationMode.HYBRID, viewModel.stabilizationMode.value)
+    viewModel.toggleSuperExtremeStability()
+    assertEquals(StabilizationMode.SUPER_EXTREME, viewModel.stabilizationMode.value)
+    assertEquals(StabilizationMode.SUPER_EXTREME, viewModel.engine.stabilizationMode)
+    assertTrue(viewModel.isHardwareStabilizationEnabled.value)
+
+    assertTrue(viewModel.isHorizonLockEnabled.value)
+    viewModel.toggleHorizonLock(false)
+    assertFalse(viewModel.isHorizonLockEnabled.value)
+    assertFalse(viewModel.engine.isHorizonLockEnabled)
+
+    viewModel.toggleSuperExtremeStability()
+    assertEquals(StabilizationMode.HYBRID, viewModel.stabilizationMode.value)
+  }
 }

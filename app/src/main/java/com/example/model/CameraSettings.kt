@@ -19,7 +19,8 @@ enum class StabilizationMode(val label: String, val description: String, val ico
     OFF("Off", "No stabilization", "Off"),
     OIS("OIS", "Optical Image Stabilization (Lens shift)", "Optical"),
     EIS("EIS", "Electronic Image Stabilization (Sensor crop)", "Electronic"),
-    HYBRID("Hybrid Pro", "OIS + EIS Dual Gyro Stabilization", "Dual Pro")
+    HYBRID("Hybrid Pro", "OIS + EIS Dual Gyro Stabilization", "Dual Pro"),
+    SUPER_EXTREME("Super Extreme", "Preview + VideoCapture + OIS/EIS + Horizon Lock", "Gimbal Ultra")
 }
 
 enum class ExposureMode(val label: String) {
