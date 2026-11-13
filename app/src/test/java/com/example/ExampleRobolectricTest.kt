@@ -183,4 +183,13 @@ class ExampleRobolectricTest {
     viewModel.setManualIso(1)
     assertEquals(hw.minIso, viewModel.manualIso.value)
   }
+
+  @Test
+  fun `mainActivity launches and renders without crashing`() {
+    val controller = org.robolectric.Robolectric.buildActivity(MainActivity::class.java).setup()
+    val activity = controller.get()
+    org.junit.Assert.assertNotNull(activity)
+    assertFalse(activity.isFinishing)
+    controller.pause().stop().destroy()
+  }
 }

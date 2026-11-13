@@ -143,7 +143,7 @@ object CameraHardwareHelper {
                 supportedHighSpeedFpsRanges = highSpeedRanges,
                 availableAeFpsRanges = targetFpsRanges
             )
-        } catch (e: Exception) {
+        } catch (_: Throwable) {
             return createFallbackInfo(isFrontCamera)
         }
     }

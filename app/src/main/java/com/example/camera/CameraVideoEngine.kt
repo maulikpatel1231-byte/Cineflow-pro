@@ -215,11 +215,22 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
     )
 
     init {
-        rotationSensor?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-        }
-        gyroscopeSensor?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
+        registerSensorSafely(rotationSensor, SensorManager.SENSOR_DELAY_GAME)
+        // Android 12+ (targetSdk >= 31) throws SecurityException for SENSOR_DELAY_FASTEST (>200Hz)
+        // without HIGH_SAMPLING_RATE_SENSORS; 6,000us (~166Hz) is smooth and safe on all devices.
+        registerSensorSafely(gyroscopeSensor, 6_000)
+    }
+
+    private fun registerSensorSafely(sensor: Sensor?, samplingPeriodUs: Int) {
+        if (sensor == null || sensorManager == null) return
+        try {
+            sensorManager.registerListener(this, sensor, samplingPeriodUs)
+        } catch (_: SecurityException) {
+            try {
+                sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
+            } catch (_: Throwable) {
+            }
+        } catch (_: Throwable) {
         }
     }
 
@@ -259,14 +270,19 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
 
             activeHardwareInfo = CameraHardwareHelper.queryCameraCapabilities(context, isFrontCamera)
 
-            val cameraSelector = if (isFrontCamera) {
+            val preferredSelector = if (isFrontCamera) {
                 CameraSelector.DEFAULT_FRONT_CAMERA
             } else {
                 CameraSelector.DEFAULT_BACK_CAMERA
             }
-
-            // Query CameraX VideoCapabilities & PreviewCapabilities for hardware-accelerated stabilization
-            val selectedCameraInfo = cameraSelector.filter(provider.availableCameraInfos).firstOrNull()
+            val availableInfos = provider.availableCameraInfos
+            val selectedCameraInfo = preferredSelector.filter(availableInfos).firstOrNull()
+                ?: availableInfos.firstOrNull()
+            val cameraSelector = if (preferredSelector.filter(availableInfos).isNotEmpty()) {
+                preferredSelector
+            } else {
+                selectedCameraInfo?.cameraSelector ?: preferredSelector
+            }
             val videoCapabilities = selectedCameraInfo?.let { Recorder.getVideoCapabilities(it) }
             val hwStabSupported = videoCapabilities?.isStabilizationSupported ?: false
             _isHardwareStabilizationSupported.value = hwStabSupported
@@ -596,10 +612,16 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             _isGlStabilizerActive.value = false
             _isGlFilterActive.value = false
 
-            val cameraSelector = if (isFrontCamera) {
+            val preferredSelector = if (isFrontCamera) {
                 CameraSelector.DEFAULT_FRONT_CAMERA
             } else {
                 CameraSelector.DEFAULT_BACK_CAMERA
+            }
+            val availableInfos = provider.availableCameraInfos
+            val cameraSelector = if (preferredSelector.filter(availableInfos).isNotEmpty()) {
+                preferredSelector
+            } else {
+                availableInfos.firstOrNull()?.cameraSelector ?: preferredSelector
             }
             val previewBuilder = Preview.Builder()
             previewUseCase = previewBuilder.build().also {

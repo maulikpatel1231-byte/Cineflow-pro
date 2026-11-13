@@ -21,6 +21,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.model.ExposureMode
 import com.example.ui.components.*
 import com.example.ui.theme.*
@@ -48,6 +51,19 @@ fun CameraScreen(
     val clips by viewModel.clips.collectAsState()
 
     val shutterText = viewModel.engine.shutterSpeeds.getOrNull(shutterIndex)?.first ?: "1/120s"
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP && viewModel.isRecording.value) {
+                viewModel.engine.stopRecording()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     // If modal is active, back press dismisses modal
     BackHandler(enabled = activeModal !is ActiveModal.None) {
