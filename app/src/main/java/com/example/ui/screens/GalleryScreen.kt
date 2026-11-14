@@ -320,15 +320,13 @@ fun ClipPlayerView(
     }
 
     LaunchedEffect(speed, mediaPlayerInstance) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            try {
-                mediaPlayerInstance?.let { mp ->
-                    val params = mp.playbackParams
-                    params.speed = speed
-                    mp.playbackParams = params
-                }
-            } catch (_: Exception) {
+        try {
+            mediaPlayerInstance?.let { mp ->
+                val params = mp.playbackParams
+                params.speed = speed
+                mp.playbackParams = params
             }
+        } catch (_: Exception) {
         }
     }
 
@@ -353,14 +351,22 @@ fun ClipPlayerView(
                     factory = { ctx ->
                         VideoView(ctx).apply {
                             videoViewRef = this
-                            val videoUri = if (clip.filePath.startsWith("content://")) {
-                                Uri.parse(clip.filePath)
-                            } else {
-                                val file = File(clip.filePath)
-                                if (file.exists()) Uri.fromFile(file) else null
+                            val videoUri = try {
+                                if (clip.filePath.startsWith("content://")) {
+                                    Uri.parse(clip.filePath)
+                                } else {
+                                    val file = File(clip.filePath)
+                                    if (file.exists()) Uri.fromFile(file) else null
+                                }
+                            } catch (_: Throwable) {
+                                null
                             }
                             if (videoUri != null) {
-                                setVideoURI(videoUri)
+                                try {
+                                    setVideoURI(videoUri)
+                                } catch (_: Throwable) {
+                                    hasPlaybackError = true
+                                }
                             } else {
                                 hasPlaybackError = true
                             }
@@ -373,11 +379,9 @@ fun ClipPlayerView(
                                 mediaPlayerInstance = mp
                                 mp.isLooping = true
                                 try {
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                        val params = PlaybackParams()
-                                        params.speed = speed
-                                        mp.playbackParams = params
-                                    }
+                                    val params = PlaybackParams()
+                                    params.speed = speed
+                                    mp.playbackParams = params
                                 } catch (_: Exception) {
                                 }
                                 mp.start()

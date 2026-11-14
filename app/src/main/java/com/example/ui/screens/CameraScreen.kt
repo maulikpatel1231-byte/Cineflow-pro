@@ -115,7 +115,7 @@ fun CameraScreen(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = String.format("REC %02d:%02d:%02d", minutes, seconds, frames),
+                            text = String.format(java.util.Locale.US, "REC %02d:%02d:%02d", minutes, seconds, frames),
                             color = Color.White,
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold,
@@ -313,7 +313,7 @@ fun CameraScreen(
             )
             ParamPill(
                 label = "EV",
-                value = "${if (manualEv > 0) "+" else ""}${String.format("%.1f", manualEv)}",
+                value = "${if (manualEv > 0) "+" else ""}${String.format(java.util.Locale.US, "%.1f", manualEv)}",
                 isHighlighted = manualEv != 0f
             )
             ParamPill(

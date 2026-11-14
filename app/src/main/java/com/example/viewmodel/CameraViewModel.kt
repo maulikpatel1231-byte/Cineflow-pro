@@ -426,10 +426,19 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         engine.isFrontCamera = _isFrontCamera.value
         _isTorchOn.value = false
         engine.isFlashTorchOn = false
-        _hardwareInfo.value = CameraHardwareHelper.queryCameraCapabilities(
+        val newHw = CameraHardwareHelper.queryCameraCapabilities(
             getApplication(),
             _isFrontCamera.value
         )
+        _hardwareInfo.value = newHw
+        val clampedIso = _manualIso.value.coerceIn(newHw.minIso, newHw.maxIso.coerceAtLeast(newHw.minIso))
+        _manualIso.value = clampedIso
+        engine.manualIso = clampedIso
+        val minEvFloat = (newHw.minEv * newHw.evStep).coerceAtMost(-0.5f)
+        val maxEvFloat = (newHw.maxEv * newHw.evStep).coerceAtLeast(0.5f)
+        val clampedEv = _manualEv.value.coerceIn(minEvFloat, maxEvFloat)
+        _manualEv.value = clampedEv
+        engine.manualEvCompensation = clampedEv
         engine.bindCameraUseCases()
     }
 

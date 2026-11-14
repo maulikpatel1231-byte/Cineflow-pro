@@ -76,10 +76,16 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
         CameraHardwareHelper.queryCameraCapabilities(context, isFrontCamera = false)
 
     // Sensors for Level / Stabilizer
-    private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
-    private val rotationSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-        ?: sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-    private val gyroscopeSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+    private val sensorManager = runCatching {
+        context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+    }.getOrNull()
+    private val rotationSensor = runCatching {
+        sensorManager?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+            ?: sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    }.getOrNull()
+    private val gyroscopeSensor = runCatching {
+        sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+    }.getOrNull()
 
     // Telemetry state
     private val _rollDegrees = MutableStateFlow(0f)
@@ -242,16 +248,42 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
         currentLifecycleOwner = lifecycleOwner
         currentPreviewView = previewView
 
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-        cameraProviderFuture.addListener({
-            try {
-                cameraProvider = cameraProviderFuture.get()
-                bindCameraUseCases()
-                onInitialized()
-            } catch (e: Exception) {
-                Log.e(TAG, "Use case binding failed", e)
+        try {
+            val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+            cameraProviderFuture.addListener({
+                try {
+                    if (currentPreviewView !== previewView ||
+                        lifecycleOwner.lifecycle.currentState == androidx.lifecycle.Lifecycle.State.DESTROYED
+                    ) {
+                        return@addListener
+                    }
+                    cameraProvider = cameraProviderFuture.get()
+                    bindCameraUseCases()
+                    onInitialized()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Use case binding failed", t)
+                }
+            }, ContextCompat.getMainExecutor(context))
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to obtain ProcessCameraProvider", t)
+        }
+    }
+
+    fun unbindPreview(previewView: PreviewView? = null) {
+        if (previewView != null && currentPreviewView !== previewView) return
+        try {
+            if (!_isRecording.value) {
+                cameraProvider?.unbindAll()
+                gyroProcessor?.release()
+                gyroProcessor = null
+                _isGlStabilizerActive.value = false
+                _isGlFilterActive.value = false
+                camera = null
             }
-        }, ContextCompat.getMainExecutor(context))
+        } catch (_: Throwable) {
+        }
+        currentPreviewView = null
+        currentLifecycleOwner = null
     }
 
     @SuppressLint("UnsafeOptInUsageError")
@@ -260,6 +292,9 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
         val provider = cameraProvider ?: return
         val lifecycleOwner = currentLifecycleOwner ?: return
         val previewView = currentPreviewView ?: return
+        if (lifecycleOwner.lifecycle.currentState == androidx.lifecycle.Lifecycle.State.DESTROYED) {
+            return
+        }
 
         try {
             provider.unbindAll()
@@ -340,16 +375,15 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 listOf(preferredQuality, Quality.FHD, Quality.HD, Quality.SD),
                 FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
             )
-            val baseBitRate = when (fpsMode) {
-                FpsMode.FPS_240 -> 60_000_000
-                FpsMode.FPS_120 -> 40_000_000
-                FpsMode.FPS_60 -> 24_000_000
-                FpsMode.FPS_30 -> 16_000_000
+            val baseBitRate = when (resolutionMode) {
+                ResolutionMode.UHD_4K -> 36_000_000
+                ResolutionMode.FHD_1080P -> if (fpsMode.fps >= 60) 24_000_000 else 16_000_000
+                ResolutionMode.HD_720P -> if (fpsMode.fps >= 60) 14_000_000 else 10_000_000
             }
             val bitRate = if (stabilizationMode == StabilizationMode.SUPER_EXTREME ||
                 gyroStabilizerStrength == GyroStabilizerStrength.LOCKDOWN
             ) {
-                (baseBitRate * 1.25).toInt()
+                (baseBitRate * 1.15).toInt()
             } else {
                 baseBitRate
             }
@@ -397,7 +431,12 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                     executor = processor.glExecutor,
                     surfaceProcessor = processor
                 ) { throwable ->
-                    Log.w(TAG, "CameraEffect error", throwable)
+                    Log.w(TAG, "CameraEffect runtime error, falling back to non-GL pipeline", throwable)
+                    coroutineScope.launch {
+                        if ((_isGlStabilizerActive.value || _isGlFilterActive.value) && !_isRecording.value) {
+                            bindCameraUseCases(allowGlEffect = false)
+                        }
+                    }
                 }
 
                 val useCaseGroup = UseCaseGroup.Builder()
@@ -414,7 +453,7 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                     )
                     _isGlStabilizerActive.value = needsGyroWarp
                     _isGlFilterActive.value = true
-                } catch (glBindError: Exception) {
+                } catch (glBindError: Throwable) {
                     Log.w(TAG, "UseCaseGroup GL CameraEffect unsupported on stream, binding direct", glBindError)
                     processor.release()
                     gyroProcessor = null
@@ -442,29 +481,33 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 TAG,
                 "Camera bound | FPS: ${fpsMode.fps} ($bestFpsRange) | Mode: ${stabilizationMode.name} | GL Gyro EIS: ${_isGlStabilizerActive.value} (${gyroStabilizerStrength.shortBadge}) | GL LUT: ${_isGlFilterActive.value} | HW Stab: $shouldEnableHwStabilization"
             )
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to bind Preview + VideoCapture, attempting Preview-only fallback", e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to bind Preview + VideoCapture, attempting Preview-only fallback", t)
             bindPreviewOnlyFallback(provider, lifecycleOwner, previewView)
         }
     }
 
     private fun syncCameraCapabilitiesFromBoundCamera() {
         val cam = camera ?: return
-        val flashAvailable = cam.cameraInfo.hasFlashUnit()
-        _hasFlashUnit.value = flashAvailable
-        if (!flashAvailable) {
-            isFlashTorchOn = false
-        }
-        cam.cameraControl.enableTorch(isFlashTorchOn && flashAvailable)
-        val zState = cam.cameraInfo.zoomState.value
-        if (zState != null) {
-            _minZoomRatio.value = zState.minZoomRatio
-            _maxZoomRatio.value = zState.maxZoomRatio
-            val clamped = _zoomRatio.value.coerceIn(zState.minZoomRatio, zState.maxZoomRatio)
-            _zoomRatio.value = clamped
-            if (clamped != 1.0f) {
-                cam.cameraControl.setZoomRatio(clamped)
+        try {
+            val flashAvailable = cam.cameraInfo.hasFlashUnit()
+            _hasFlashUnit.value = flashAvailable
+            if (!flashAvailable) {
+                isFlashTorchOn = false
             }
+            cam.cameraControl.enableTorch(isFlashTorchOn && flashAvailable)
+            val zState = cam.cameraInfo.zoomState.value
+            if (zState != null) {
+                _minZoomRatio.value = zState.minZoomRatio
+                _maxZoomRatio.value = zState.maxZoomRatio
+                val clamped = _zoomRatio.value.coerceIn(zState.minZoomRatio, zState.maxZoomRatio)
+                _zoomRatio.value = clamped
+                if (clamped != 1.0f) {
+                    cam.cameraControl.setZoomRatio(clamped)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Error syncing camera capabilities", t)
         }
     }
 
@@ -485,11 +528,16 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
         if (!textureView.isAvailable) return
 
         try {
-            val bmp = analysisBitmap ?: Bitmap.createBitmap(
-                ANALYSIS_COLS,
-                ANALYSIS_ROWS,
-                Bitmap.Config.ARGB_8888
-            ).also { analysisBitmap = it }
+            val existing = analysisBitmap
+            val bmp = if (existing != null && !existing.isRecycled) {
+                existing
+            } else {
+                Bitmap.createBitmap(
+                    ANALYSIS_COLS,
+                    ANALYSIS_ROWS,
+                    Bitmap.Config.ARGB_8888
+                ).also { analysisBitmap = it }
+            }
 
             textureView.getBitmap(bmp)
             bmp.getPixels(analysisPixels, 0, ANALYSIS_COLS, 0, 0, ANALYSIS_COLS, ANALYSIS_ROWS)
@@ -639,73 +687,85 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
         extender: Camera2Interop.Extender<*>,
         previewStabSupported: Boolean = _isPreviewStabilizationSupported.value
     ) {
-        if (!isHardwareVideoStabilizationEnabled) {
-            extender.setCaptureRequestOption(
-                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
-            )
-            extender.setCaptureRequestOption(
-                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
-            )
+        val supportsOis = activeHardwareInfo.supportsOis
+        val supportsEis = activeHardwareInfo.supportsEis
+
+        if (!isHardwareVideoStabilizationEnabled || stabilizationMode == StabilizationMode.OFF) {
+            if (supportsEis) {
+                extender.setCaptureRequestOption(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                )
+            }
+            if (supportsOis) {
+                extender.setCaptureRequestOption(
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                )
+            }
             return
         }
 
         when (stabilizationMode) {
-            StabilizationMode.OFF -> {
-                extender.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
-                )
-                extender.setCaptureRequestOption(
-                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
-                )
-            }
+            StabilizationMode.OFF -> Unit
             StabilizationMode.OIS -> {
-                extender.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
-                )
-                extender.setCaptureRequestOption(
-                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
-                )
+                if (supportsEis) {
+                    extender.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                    )
+                }
+                if (supportsOis) {
+                    extender.setCaptureRequestOption(
+                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                        CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                    )
+                }
             }
             StabilizationMode.EIS -> {
-                extender.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                )
-                extender.setCaptureRequestOption(
-                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
-                )
+                if (supportsEis) {
+                    extender.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                    )
+                }
+                if (supportsOis) {
+                    extender.setCaptureRequestOption(
+                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                        CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                    )
+                }
             }
             StabilizationMode.HYBRID -> {
-                extender.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                )
-                extender.setCaptureRequestOption(
-                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
-                )
+                if (supportsEis) {
+                    extender.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                    )
+                }
+                if (supportsOis) {
+                    extender.setCaptureRequestOption(
+                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                        CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                    )
+                }
             }
             StabilizationMode.SUPER_EXTREME -> {
-                val eisMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && previewStabSupported) {
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
-                } else {
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                // If previewBuilder.setPreviewStabilizationEnabled(true) was applied, let CameraX manage stabilization mode
+                if (!previewStabSupported) {
+                    if (supportsEis) {
+                        extender.setCaptureRequestOption(
+                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                        )
+                    }
+                    if (supportsOis) {
+                        extender.setCaptureRequestOption(
+                            CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                            CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                        )
+                    }
                 }
-                extender.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    eisMode
-                )
-                extender.setCaptureRequestOption(
-                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
-                )
             }
         }
     }
@@ -855,54 +915,86 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
                 )
             }
 
-            // Stabilization
+            // Stabilization (only apply Camera2 modes reported as supported by this lens)
+            val supportsOis = activeHardwareInfo.supportsOis
+            val supportsEis = activeHardwareInfo.supportsEis
             if (!isHardwareVideoStabilizationEnabled || stabilizationMode == StabilizationMode.OFF) {
-                optionsBuilder.setCaptureRequestOption(
-                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
-                )
-                optionsBuilder.setCaptureRequestOption(
-                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
-                )
+                if (supportsEis) {
+                    optionsBuilder.setCaptureRequestOption(
+                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                    )
+                }
+                if (supportsOis) {
+                    optionsBuilder.setCaptureRequestOption(
+                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                        CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                    )
+                }
             } else {
                 when (stabilizationMode) {
                     StabilizationMode.OIS -> {
-                        optionsBuilder.setCaptureRequestOption(
-                            CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                            CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
-                        )
+                        if (supportsEis) {
+                            optionsBuilder.setCaptureRequestOption(
+                                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                            )
+                        }
+                        if (supportsOis) {
+                            optionsBuilder.setCaptureRequestOption(
+                                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                            )
+                        }
                     }
                     StabilizationMode.EIS -> {
-                        optionsBuilder.setCaptureRequestOption(
-                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                        )
+                        if (supportsEis) {
+                            optionsBuilder.setCaptureRequestOption(
+                                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                            )
+                        }
+                        if (supportsOis) {
+                            optionsBuilder.setCaptureRequestOption(
+                                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                            )
+                        }
                     }
                     StabilizationMode.HYBRID -> {
-                        optionsBuilder.setCaptureRequestOption(
-                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                        )
-                        optionsBuilder.setCaptureRequestOption(
-                            CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                            CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
-                        )
+                        if (supportsEis) {
+                            optionsBuilder.setCaptureRequestOption(
+                                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                            )
+                        }
+                        if (supportsOis) {
+                            optionsBuilder.setCaptureRequestOption(
+                                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                            )
+                        }
                     }
                     StabilizationMode.SUPER_EXTREME -> {
-                        val eisMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && _isPreviewStabilizationSupported.value) {
-                            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && _isPreviewStabilizationSupported.value) {
+                            optionsBuilder.setCaptureRequestOption(
+                                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_PREVIEW_STABILIZATION
+                            )
                         } else {
-                            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                            if (supportsEis) {
+                                optionsBuilder.setCaptureRequestOption(
+                                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                                )
+                            }
+                            if (supportsOis) {
+                                optionsBuilder.setCaptureRequestOption(
+                                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                    CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                                )
+                            }
                         }
-                        optionsBuilder.setCaptureRequestOption(
-                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                            eisMode
-                        )
-                        optionsBuilder.setCaptureRequestOption(
-                            CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                            CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
-                        )
                     }
                     StabilizationMode.OFF -> Unit
                 }
@@ -951,9 +1043,9 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
             )
 
             camera2Control.setCaptureRequestOptions(optionsBuilder.build())
-            cam.cameraControl.enableTorch(isFlashTorchOn)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error updating live camera controls", e)
+            cam.cameraControl.enableTorch(isFlashTorchOn && _hasFlashUnit.value)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error updating live camera controls", t)
         }
     }
 
@@ -1177,75 +1269,78 @@ class CameraVideoEngine(private val context: Context) : SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        if (event == null) return
-        if (event.sensor.type == Sensor.TYPE_ROTATION_VECTOR) {
-            val rotationMatrix = FloatArray(9)
-            SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-            val orientation = FloatArray(3)
-            SensorManager.getOrientation(rotationMatrix, orientation)
-            val rawPitch = Math.toDegrees(orientation[1].toDouble()).toFloat()
-            val rawRoll = -Math.toDegrees(orientation[2].toDouble()).toFloat()
+        if (event == null || event.values.size < 3) return
+        try {
+            if (event.sensor.type == Sensor.TYPE_ROTATION_VECTOR) {
+                val rotationMatrix = FloatArray(9)
+                SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+                val orientation = FloatArray(3)
+                SensorManager.getOrientation(rotationMatrix, orientation)
+                val rawPitch = Math.toDegrees(orientation[1].toDouble()).toFloat()
+                val rawRoll = -Math.toDegrees(orientation[2].toDouble()).toFloat()
 
-            gyroFilter.onRotationRollSample(rawRoll)
+                gyroFilter.onRotationRollSample(rawRoll)
 
-            val alpha = if (stabilizationMode == StabilizationMode.SUPER_EXTREME) 0.14f else 0.25f
-            filteredPitch = filteredPitch * (1f - alpha) + rawPitch * alpha
-            filteredRoll = filteredRoll * (1f - alpha) + rawRoll * alpha
+                val alpha = if (stabilizationMode == StabilizationMode.SUPER_EXTREME) 0.14f else 0.25f
+                filteredPitch = filteredPitch * (1f - alpha) + rawPitch * alpha
+                filteredRoll = filteredRoll * (1f - alpha) + rawRoll * alpha
 
-            _pitchDegrees.value = filteredPitch
-            _rollDegrees.value = filteredRoll
+                _pitchDegrees.value = filteredPitch
+                _rollDegrees.value = filteredRoll
 
-            val rollDelta = Math.abs(filteredRoll)
-            val isExtreme = stabilizationMode == StabilizationMode.SUPER_EXTREME && isHardwareVideoStabilizationEnabled
-            _horizonLockAngle.value = if (isExtreme && isHorizonLockEnabled) {
-                (-filteredRoll).coerceIn(-18f, 18f)
-            } else {
-                0f
+                val rollDelta = Math.abs(filteredRoll)
+                val isExtreme = stabilizationMode == StabilizationMode.SUPER_EXTREME && isHardwareVideoStabilizationEnabled
+                _horizonLockAngle.value = if (isExtreme && isHorizonLockEnabled) {
+                    (-filteredRoll).coerceIn(-18f, 18f)
+                } else {
+                    0f
+                }
+
+                val baseEfficiency = when {
+                    stabilizationMode == StabilizationMode.OFF -> 0.40f
+                    _isGlStabilizerActive.value && gyroStabilizerStrength == GyroStabilizerStrength.LOCKDOWN -> 0.99f
+                    _isGlStabilizerActive.value && gyroStabilizerStrength == GyroStabilizerStrength.ACTION -> 0.96f
+                    stabilizationMode == StabilizationMode.SUPER_EXTREME -> 0.98f
+                    stabilizationMode == StabilizationMode.HYBRID -> 0.93f
+                    else -> 0.85f
+                }
+                val motionPenalty = (rollDelta / 60f).coerceIn(0f, 0.15f)
+                val eff = (baseEfficiency - (if (isExtreme || _isGlStabilizerActive.value) motionPenalty * 0.15f else motionPenalty)).coerceIn(0.35f, 0.99f)
+                _stabilizerDamping.value = eff
+                _stabilityScore.value = (eff * 100).roundToInt()
+            } else if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
+                val gx = event.values[0]
+                val gy = event.values[1]
+                val gz = event.values[2]
+
+                gyroFilter.onGyroSample(gx, gy, gz, event.timestamp)
+
+                gyroVelX = gyroVelX * 0.72f + gy * 0.28f
+                gyroVelY = gyroVelY * 0.72f + gx * 0.28f
+
+                if (stabilizationMode == StabilizationMode.SUPER_EXTREME && isHardwareVideoStabilizationEnabled) {
+                    _shakeCompX.value = (-gyroVelX * 14f).coerceIn(-18f, 18f)
+                    _shakeCompY.value = (-gyroVelY * 14f).coerceIn(-18f, 18f)
+                } else {
+                    _shakeCompX.value = 0f
+                    _shakeCompY.value = 0f
+                }
+            } else if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+                val ax = event.values[0]
+                val ay = event.values[1]
+                val az = event.values[2]
+                val roll = Math.toDegrees(atan2(ax.toDouble(), sqrt(ay.toDouble() * ay + az.toDouble() * az))).toFloat()
+                gyroFilter.onRotationRollSample(roll)
+                filteredRoll = filteredRoll * 0.85f + roll * 0.15f
+                _rollDegrees.value = filteredRoll
+                val isExtreme = stabilizationMode == StabilizationMode.SUPER_EXTREME && isHardwareVideoStabilizationEnabled
+                _horizonLockAngle.value = if (isExtreme && isHorizonLockEnabled) {
+                    (-filteredRoll).coerceIn(-18f, 18f)
+                } else {
+                    0f
+                }
             }
-
-            val baseEfficiency = when {
-                stabilizationMode == StabilizationMode.OFF -> 0.40f
-                _isGlStabilizerActive.value && gyroStabilizerStrength == GyroStabilizerStrength.LOCKDOWN -> 0.99f
-                _isGlStabilizerActive.value && gyroStabilizerStrength == GyroStabilizerStrength.ACTION -> 0.96f
-                stabilizationMode == StabilizationMode.SUPER_EXTREME -> 0.98f
-                stabilizationMode == StabilizationMode.HYBRID -> 0.93f
-                else -> 0.85f
-            }
-            val motionPenalty = (rollDelta / 60f).coerceIn(0f, 0.15f)
-            val eff = (baseEfficiency - (if (isExtreme || _isGlStabilizerActive.value) motionPenalty * 0.15f else motionPenalty)).coerceIn(0.35f, 0.99f)
-            _stabilizerDamping.value = eff
-            _stabilityScore.value = (eff * 100).roundToInt()
-        } else if (event.sensor.type == Sensor.TYPE_GYROSCOPE) {
-            val gx = event.values[0]
-            val gy = event.values[1]
-            val gz = event.values[2]
-
-            gyroFilter.onGyroSample(gx, gy, gz, event.timestamp)
-
-            gyroVelX = gyroVelX * 0.72f + gy * 0.28f
-            gyroVelY = gyroVelY * 0.72f + gx * 0.28f
-
-            if (stabilizationMode == StabilizationMode.SUPER_EXTREME && isHardwareVideoStabilizationEnabled) {
-                _shakeCompX.value = (-gyroVelX * 14f).coerceIn(-18f, 18f)
-                _shakeCompY.value = (-gyroVelY * 14f).coerceIn(-18f, 18f)
-            } else {
-                _shakeCompX.value = 0f
-                _shakeCompY.value = 0f
-            }
-        } else if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-            val ax = event.values[0]
-            val ay = event.values[1]
-            val az = event.values[2]
-            val roll = Math.toDegrees(atan2(ax.toDouble(), sqrt(ay.toDouble() * ay + az.toDouble() * az))).toFloat()
-            gyroFilter.onRotationRollSample(roll)
-            filteredRoll = filteredRoll * 0.85f + roll * 0.15f
-            _rollDegrees.value = filteredRoll
-            val isExtreme = stabilizationMode == StabilizationMode.SUPER_EXTREME && isHardwareVideoStabilizationEnabled
-            _horizonLockAngle.value = if (isExtreme && isHorizonLockEnabled) {
-                (-filteredRoll).coerceIn(-18f, 18f)
-            } else {
-                0f
-            }
+        } catch (_: Throwable) {
         }
     }
 

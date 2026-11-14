@@ -175,12 +175,12 @@ fun StabilizerSelector(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Roll: ${String.format("%.1f", rollDegrees)}°",
+                        text = "Roll: ${String.format(java.util.Locale.US, "%.1f", rollDegrees)}°",
                         color = CinemaTextPrimary,
                         fontSize = 10.sp
                     )
                     Text(
-                        text = "Pitch: ${String.format("%.1f", pitchDegrees)}°",
+                        text = "Pitch: ${String.format(java.util.Locale.US, "%.1f", pitchDegrees)}°",
                         color = CinemaTextPrimary,
                         fontSize = 10.sp
                     )
@@ -204,7 +204,7 @@ fun StabilizerSelector(
                     )
                     Text(
                         text = if (isGlStabilizerActive) {
-                            "GL Rec: -${String.format("%.1f", shakeCancelledDegrees)}°"
+                            "GL Rec: -${String.format(java.util.Locale.US, "%.1f", shakeCancelledDegrees)}°"
                         } else {
                             "GL Rec: Bypass"
                         },

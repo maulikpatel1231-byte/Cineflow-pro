@@ -192,4 +192,50 @@ class ExampleRobolectricTest {
     assertFalse(activity.isFinishing)
     controller.pause().stop().destroy()
   }
+
+  @Test
+  fun `launcher adaptive icon drawables inflate without xml errors`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val bg = androidx.core.content.ContextCompat.getDrawable(context, R.drawable.ic_launcher_background)
+    val fg = androidx.core.content.ContextCompat.getDrawable(context, R.drawable.ic_launcher_foreground)
+    val launcher = androidx.core.content.ContextCompat.getDrawable(context, R.mipmap.ic_launcher)
+    val roundLauncher = androidx.core.content.ContextCompat.getDrawable(context, R.mipmap.ic_launcher_round)
+
+    org.junit.Assert.assertNotNull(bg)
+    org.junit.Assert.assertNotNull(fg)
+    org.junit.Assert.assertNotNull(launcher)
+    org.junit.Assert.assertNotNull(roundLauncher)
+  }
+
+  @Test
+  fun `mainActivity with granted camera and audio permissions renders camera screen and navigates to gallery`() {
+    val app = ApplicationProvider.getApplicationContext<Application>()
+    val shadowApp = org.robolectric.Shadows.shadowOf(app)
+    shadowApp.grantPermissions(
+      android.Manifest.permission.CAMERA,
+      android.Manifest.permission.RECORD_AUDIO
+    )
+
+    val controller = org.robolectric.Robolectric.buildActivity(MainActivity::class.java).setup()
+    val activity = controller.get()
+    org.junit.Assert.assertNotNull(activity)
+    assertFalse(activity.isFinishing)
+
+    val vm = androidx.lifecycle.ViewModelProvider(activity)[CameraViewModel::class.java]
+    vm.navigateTo("gallery")
+    assertEquals("gallery", vm.currentScreen.value)
+    vm.navigateTo("camera")
+    assertEquals("camera", vm.currentScreen.value)
+
+    controller.pause().stop().destroy()
+  }
+
+  @Test
+  fun `gyroStabilizerSurfaceProcessor handles release cleanly without throwing`() {
+    val filter = com.example.camera.GyroStabilizerFilter()
+    val processor = com.example.camera.GyroStabilizerSurfaceProcessor(filter = filter)
+    processor.glExecutor.execute { }
+    processor.release()
+    processor.release()
+  }
 }

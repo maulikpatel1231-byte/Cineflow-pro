@@ -155,11 +155,16 @@ fun CameraPreviewView(
                     )
                     implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                     scaleType = PreviewView.ScaleType.FILL_CENTER
-                    viewModel.engine.startCamera(
-                        lifecycleOwner = lifecycleOwner,
-                        previewView = this
-                    )
+                    post {
+                        viewModel.engine.startCamera(
+                            lifecycleOwner = lifecycleOwner,
+                            previewView = this
+                        )
+                    }
                 }
+            },
+            onRelease = { previewView ->
+                viewModel.engine.unbindPreview(previewView)
             },
             modifier = Modifier
                 .fillMaxSize()
@@ -466,7 +471,7 @@ fun SuperExtremePill(
             )
             Spacer(modifier = Modifier.width(6.dp))
             val shakeText = if (shakeCancelledDegrees >= 0.4f) {
-                " • -${String.format("%.1f", shakeCancelledDegrees)}°"
+                " • -${String.format(java.util.Locale.US, "%.1f", shakeCancelledDegrees)}°"
             } else {
                 ""
             }

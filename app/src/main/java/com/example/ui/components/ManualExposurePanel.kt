@@ -240,7 +240,7 @@ fun ManualExposurePanel(
                 ) {
                     Text(text = "EXPOSURE COMPENSATION (EV)", color = CinemaTextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     Text(
-                        text = "${if (manualEv > 0) "+" else ""}${String.format("%.1f", manualEv)} EV",
+                        text = "${if (manualEv > 0) "+" else ""}${String.format(java.util.Locale.US, "%.1f", manualEv)} EV",
                         color = CinemaAmber,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Bold
