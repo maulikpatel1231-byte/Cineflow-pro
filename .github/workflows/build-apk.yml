@@ -31,7 +31,7 @@ jobs:
           echo "Detected Java version string: $JAVA_VER_STR"
           MAJOR_VER=$(echo "$JAVA_VER_STR" | awk -F '.' '{print ($1 == "1" ? $2 : $1)}')
           echo "Detected Java major version: $MAJOR_VER"
-          if [ -z "$MAJOR_VER" ]; then
+          if [ -z "$MAJOR_VER" ] || ! [[ "$MAJOR_VER" =~ ^[0-9]+$ ]]; then
             echo "ERROR: Java version cannot be detected."
             exit 1
           fi
@@ -176,10 +176,13 @@ jobs:
           if [ "${{ steps.create_release.outcome }}" = "success" ]; then
             echo "=== RELEASE SUCCESSFUL ==="
             gh release view "$TAG"
+            RELEASE_URL="$(gh release view "$TAG" --json url --jq '.url')"
             echo "Release Tag: $TAG"
             echo "Release Title: Debug APK Build #${{ github.run_number }}"
+            echo "Release Page URL: $RELEASE_URL"
             echo "Release Asset: app-debug.apk"
             echo "Direct Download URL: $DIRECT_URL"
+            echo "Backup Actions Artifact: app-debug-apk remains available as a backup."
 
             {
               echo "## DIRECT APK DOWNLOAD"
